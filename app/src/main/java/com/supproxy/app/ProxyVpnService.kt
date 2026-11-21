@@ -5,194 +5,285 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
-import android.os.ParcelFileDescriptor
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import com.github.shadowsocks.bg.Tun2proxy
 import hev.htproxy.TProxyService
 import java.io.File
 import java.io.IOException
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.URLEncoder
 
 class ProxyVpnService : VpnService() {
 
     companion object {
         const val ACTION_START = "com.supproxy.app.START"
         const val ACTION_STOP = "com.supproxy.app.STOP"
+        const val ACTION_RESTART = "com.supproxy.app.RESTART"
         const val ACTION_STATE = "com.supproxy.app.STATE"
         private const val CHANNEL = "vpn"
+        private const val MTU = 1500
+        private const val MAPPED_DNS = "198.18.0.2"
+        private const val TCP_DNS = "1.1.1.1"
+        private const val CHECK_INTERVAL_MS = 8_000L
+        private const val FIRST_RETRY_MS = 2_000L
+        private const val MAX_RETRY_MS = 60_000L
 
-        /** Disconnected, Connecting, Connected or Reconnecting. */
         @Volatile var status = "Disconnected"
         @Volatile var error: String? = null
+        @Volatile var usingDnsOverTcp = false
     }
 
-    private var tun: ParcelFileDescriptor? = null
-    private var bridge: HttpBridge? = null
-    private var cfg: File? = null
-    private var hevStarted = false
-    @Volatile private var watching = false
-    @Volatile private var generation = 0
+    private val main = Handler(Looper.getMainLooper())
+    private var worker: Thread? = null
+    @Volatile private var stopRequested = false
+    private var destroyed = false
+    private var restartRequested = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val a = intent?.action
-        if (a == ACTION_STOP) {
-            error = null
-            stopVpn()
-            return START_NOT_STICKY
-        }
-        if (a != ACTION_START && a != SERVICE_INTERFACE) return START_NOT_STICKY
-        if (tun != null) return START_NOT_STICKY
-
-        try {
-            showForeground()
-        } catch (e: RuntimeException) {
-            error = "Could not start the VPN service: ${e.message ?: e.javaClass.simpleName}"
-            stopVpn()
-            return START_NOT_STICKY
-        }
-        val pr = Store.active(this)
-        if (pr.host.isBlank()) {
-            error = "No server configured"
-            stopVpn()
-            return START_NOT_STICKY
-        }
-        error = null
-        setStatus("Connecting")
-        val gen = ++generation
-
-        Thread {
-            try {
-                // Resolve before the tunnel exists so DNS still works
-                val upIp = InetAddress.getByName(pr.host).hostAddress ?: throw IOException("Cannot resolve ${pr.host}")
-                var th = upIp
-                var tp = pr.port
-                var tu = ""
-                var tpw = ""
-                val http = pr.protocol == "HTTP"
-                if (http) {
-                    val br = HttpBridge(upIp, pr.port, if (pr.auth) pr.user else null, pr.pass)
-                    br.start()
-                    bridge = br
-                    th = "127.0.0.1"
-                    tp = br.localPort
-                } else if (pr.auth) {
-                    tu = pr.user
-                    tpw = pr.pass
-                }
-
-                val b = Builder()
-                    .setSession("Supproxy")
-                    .setMtu(1500)
-                    .addAddress("198.18.0.1", 32)
-                    .addAddress("fc00::1", 128)
-                    .addRoute("0.0.0.0", 0)
-                    .addRoute("::", 0)
-                    .addDnsServer("198.18.0.2")
-                    .addDisallowedApplication(packageName) // prevents routing loop
-                if (!Store.wholePhone(this)) {
-                    for (pkg in Store.excluded(this)) {
-                        try { b.addDisallowedApplication(pkg) } catch (_: Throwable) {}
-                    }
-                }
-                val pfd = b.establish() ?: throw IOException("VPN permission revoked")
-                if (gen != generation) {
-                    try { pfd.close() } catch (_: Throwable) {}
-                    return@Thread
-                }
-                tun = pfd
-
-                val f = File(filesDir, "tproxy.yaml")
-                f.writeText(config(th, tp, tu, tpw, !http))
-                cfg = f
-                hevStarted = TProxyService.TProxyStartService(f.absolutePath, pfd.fd)
-                if (!hevStarted || !TProxyService.TProxyIsRunning()) {
-                    throw IOException("Could not start the proxy tunnel")
-                }
-
-                setStatus("Connected")
-                showForeground("Connected to ${pr.host}:${pr.port}")
-                startWatchdog(upIp, pr.port, gen)
-            } catch (e: Throwable) {
-                error = e.message ?: e.javaClass.simpleName
-                stopVpn()
+        val action = intent?.action
+        when (action) {
+            ACTION_STOP -> {
+                restartRequested = false
+                error = null
+                requestStop()
             }
-        }.start()
-
+            ACTION_RESTART -> {
+                if (worker == null) launch() else {
+                    restartRequested = true
+                    requestStop()
+                }
+            }
+            ACTION_START, SERVICE_INTERFACE -> if (worker == null) launch()
+        }
         return START_NOT_STICKY
     }
 
-    private fun q(s: String) = "'" + s.replace("'", "''") + "'"
-
-    private fun config(host: String, port: Int, user: String, pass: String, udp: Boolean) = buildString {
-        append("tunnel:\n  mtu: 1500\n  ipv4: 198.18.0.1\n  ipv6: 'fc00::1'\n")
-        append("socks5:\n  port: $port\n  address: ${q(host)}\n  udp: '${if (udp) "udp" else "tcp"}'\n")
-        if (user.isNotEmpty()) append("  username: ${q(user)}\n  password: ${q(pass)}\n")
-        // DNS is answered locally and resolved by the proxy, so lookups never leak
-        append("mapdns:\n  address: 198.18.0.2\n  port: 53\n  network: 100.64.0.0\n  netmask: 255.192.0.0\n  cache-size: 10000\n")
-        append("misc:\n  log-level: warn\n")
-    }
-
-    private fun startWatchdog(host: String, port: Int, gen: Int) {
-        if (!Store.autoReconnect(this)) return
-        watching = true
-        Thread {
-            var fails = 0
-            while (watching && gen == generation) {
-                try { Thread.sleep(8000) } catch (_: InterruptedException) { return@Thread }
-                if (!watching || gen != generation) return@Thread
-                val ok = try {
-                    Socket().use { it.connect(InetSocketAddress(host, port), 4000) }
-                    true
-                } catch (_: Throwable) { false }
-                if (!ok) {
-                    fails++
-                    if (fails == 2) setStatus("Reconnecting")
-                } else {
-                    if (fails >= 2) {
-                        if (!restartTunnel(gen)) return@Thread
-                        setStatus("Connected")
-                    }
-                    fails = 0
-                }
-            }
-        }.start()
-    }
-
-    private fun restartTunnel(gen: Int): Boolean {
+    private fun launch() {
         try {
-            TProxyService.TProxyStopService()
-            Thread.sleep(400)
-            if (gen != generation) return false
-            val t = tun ?: return false
-            val f = cfg ?: return false
-            if (!TProxyService.TProxyStartService(f.absolutePath, t.fd)) {
-                throw IOException("Could not restart the proxy tunnel")
+            showForeground("Starting tunnel")
+        } catch (e: RuntimeException) {
+            finish("Could not start the VPN service: ${e.message ?: e.javaClass.simpleName}")
+            return
+        }
+
+        error = null
+        stopRequested = false
+        setStatus("Connecting")
+        worker = Thread({
+            var failure: String? = null
+            try {
+                runVpn()
+            } catch (e: InterruptedException) {
+                if (!stopRequested) failure = "VPN startup interrupted"
+            } catch (e: Exception) {
+                if (!stopRequested) failure = e.message ?: e.javaClass.simpleName
+            } catch (_: LinkageError) {
+                if (!stopRequested) failure = "Could not load the native tunnel engine"
+            } finally {
+                main.post { if (!destroyed) finish(if (stopRequested) null else failure) }
             }
-            return true
-        } catch (e: Exception) {
-            if (gen == generation) {
-                error = e.message ?: "Could not restart the proxy tunnel"
-                stopVpn()
+        }, "Supproxy VPN").also { it.start() }
+    }
+
+    private fun runVpn() {
+        val profile = Store.active(this)
+        if (profile.host.isBlank() || profile.port !in 1..65535) throw IOException("Enter a valid proxy server and port")
+        val dnsOverTcp = Store.dnsOverTcp(this)
+        val builder = vpnBuilder(dnsOverTcp)
+        var address = waitForProxy(profile)
+        if (stopRequested) return
+
+        val descriptor = builder.establish() ?: throw IOException("VPN permission revoked")
+        usingDnsOverTcp = dnsOverTcp
+        descriptor.use { tun ->
+            while (!stopRequested) {
+                val bridge = if (profile.protocol == "HTTP") {
+                    HttpBridge(address, profile.port, profile.user.takeIf { profile.auth }, profile.pass)
+                } else null
+                try {
+                    bridge?.start()
+                    val host = if (bridge == null) address else "127.0.0.1"
+                    val port = bridge?.localPort ?: profile.port
+                    val user = profile.user.takeIf { profile.auth && bridge == null }.orEmpty()
+                    val password = profile.pass.takeIf { user.isNotEmpty() }.orEmpty()
+
+                    if (dnsOverTcp) {
+                        runTcpDnsTunnel(tun.fd, host, port, user, password, profile)
+                    } else {
+                        runMappedDnsTunnel(tun.fd, host, port, user, password, bridge == null, profile)
+                    }
+                } finally {
+                    bridge?.stop()
+                }
+                if (stopRequested) return
+                if (!Store.autoReconnect(this)) throw IOException("Proxy connection lost")
+                address = waitForProxy(profile, reconnecting = true)
             }
-            return false
         }
     }
 
-    private fun setStatus(s: String) {
-        status = s
+    private fun vpnBuilder(dnsOverTcp: Boolean): Builder {
+        val builder = Builder()
+            .setSession("Supproxy")
+            .setMtu(MTU)
+            .addAddress("198.18.0.1", 32)
+            .addAddress("fc00::1", 128)
+            .addRoute("0.0.0.0", 0)
+            .addRoute("::", 0)
+            .addDnsServer(if (dnsOverTcp) TCP_DNS else MAPPED_DNS)
+
+        if (Store.wholePhone(this)) {
+            builder.addDisallowedApplication(packageName)
+        } else {
+            val excluded = Store.excluded(this)
+            var allowedCount = 0
+            for (app in Store.routablePackages(this)) {
+                if (app in excluded) continue
+                try {
+                    builder.addAllowedApplication(app)
+                    allowedCount++
+                } catch (_: PackageManager.NameNotFoundException) {
+                    // The package was removed after the app list was read.
+                }
+            }
+            if (allowedCount == 0) throw IOException("Select at least one app before connecting")
+        }
+        return builder
+    }
+
+    private fun waitForProxy(profile: Profile, reconnecting: Boolean = false): String {
+        var retryMs = FIRST_RETRY_MS
+        var wait = reconnecting
+        while (!stopRequested) {
+            if (wait) {
+                if (!Store.autoReconnect(this)) throw IOException("Proxy connection lost")
+                setStatus("Reconnecting")
+                showForeground("Retrying in ${retryMs / 1000} s")
+                Thread.sleep(retryMs)
+                retryMs = (retryMs * 2).coerceAtMost(MAX_RETRY_MS)
+            }
+            try {
+                return reachableAddress(profile)
+            } catch (e: IOException) {
+                if (!Store.autoReconnect(this)) throw IOException("Cannot reach the proxy server", e)
+                wait = true
+            }
+        }
+        throw InterruptedException()
+    }
+
+    private fun reachableAddress(profile: Profile): String {
+        for (address in InetAddress.getAllByName(profile.host)) {
+            if (stopRequested) throw InterruptedException()
+            val ip = address.hostAddress ?: continue
+            try {
+                Socket().use { it.connect(InetSocketAddress(address, profile.port), 4_000) }
+                return ip
+            } catch (_: IOException) {
+                // Try the other address family if this endpoint is unavailable.
+            }
+        }
+        throw IOException("Cannot reach the proxy server")
+    }
+
+    private fun monitor(profile: Profile, isRunning: () -> Boolean) {
+        if (stopRequested) return
+        val connected = "Connected to ${profile.host}:${profile.port}"
+        showForeground(connected)
+        setStatus("Connected")
+        var nextProbe = SystemClock.elapsedRealtime() + CHECK_INTERVAL_MS
+        while (!stopRequested && isRunning()) {
+            if (SystemClock.elapsedRealtime() >= nextProbe) {
+                val reachable = try {
+                    reachableAddress(profile)
+                    true
+                } catch (_: IOException) { false }
+                if (!reachable) return
+                nextProbe = SystemClock.elapsedRealtime() + CHECK_INTERVAL_MS
+            }
+            Thread.sleep(500)
+        }
+    }
+
+    private fun runMappedDnsTunnel(
+        fd: Int, host: String, port: Int, user: String, pass: String, udp: Boolean, profile: Profile
+    ) {
+        val config = File(filesDir, "tproxy.yaml")
+        try {
+            config.writeText(buildString {
+                append("tunnel:\n  mtu: $MTU\n  ipv4: 198.18.0.1\n  ipv6: 'fc00::1'\n")
+                append("socks5:\n  port: $port\n  address: ${yamlString(host)}\n  udp: '${if (udp) "udp" else "tcp"}'\n")
+                if (user.isNotEmpty()) append("  username: ${yamlString(user)}\n  password: ${yamlString(pass)}\n")
+                append("mapdns:\n  address: $MAPPED_DNS\n  port: 53\n  network: 100.64.0.0\n  netmask: 255.192.0.0\n  cache-size: 10000\n")
+                append("misc:\n  log-level: warn\n")
+            })
+            if (!TProxyService.TProxyStartService(config.absolutePath, fd)) throw IOException("Could not start the proxy tunnel")
+            try {
+                if (!TProxyService.TProxyIsRunning()) throw IOException("Could not start the proxy tunnel")
+                monitor(profile, TProxyService::TProxyIsRunning)
+            } finally {
+                TProxyService.TProxyStopService()
+            }
+        } finally {
+            config.delete()
+        }
+    }
+
+    private fun runTcpDnsTunnel(fd: Int, host: String, port: Int, user: String, pass: String, profile: Profile) {
+        val authority = if (":" in host) "[$host]" else host
+        val credentials = if (user.isEmpty()) "" else "${encode(user)}:${encode(pass)}@"
+        val args = "tun2proxy --tun-fd $fd --close-fd-on-drop false --proxy socks5://$credentials$authority:$port " +
+            "--dns over-tcp --dns-addr $TCP_DNS --ipv6-enabled --verbosity off"
+
+        var nativeFailure: LinkageError? = null
+        val engine = Thread({
+            try {
+                Tun2proxy.run(args, MTU.toChar())
+            } catch (e: LinkageError) {
+                nativeFailure = e
+            }
+        }, "Supproxy DNS tunnel").apply { start() }
+        try {
+            engine.join(200)
+            if (!engine.isAlive) {
+                nativeFailure?.let { throw it }
+                throw IOException("Could not start the DNS-over-TCP tunnel")
+            }
+            monitor(profile) { engine.isAlive }
+        } finally {
+            // Clear a cancellation interrupt while waiting for the native engine to release the TUN.
+            Thread.interrupted()
+            while (engine.isAlive) {
+                try { Tun2proxy.stop() } catch (_: LinkageError) { break }
+                engine.join(100)
+            }
+        }
+    }
+
+    private fun yamlString(value: String) = "'" + value.replace("'", "''") + "'"
+
+    private fun encode(value: String) = URLEncoder.encode(value, "UTF-8").replace("+", "%20")
+
+    private fun setStatus(value: String) {
+        status = value
         sendBroadcast(Intent(ACTION_STATE).setPackage(packageName))
     }
 
-    private fun showForeground(text: String = "Starting tunnel") {
+    private fun showForeground(text: String) {
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(NotificationChannel(CHANNEL, "VPN status", NotificationManager.IMPORTANCE_LOW))
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
         )
-        val n = Notification.Builder(this, CHANNEL)
+        val notification = Notification.Builder(this, CHANNEL)
             .setContentTitle("Supproxy")
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_stat)
@@ -200,35 +291,54 @@ class ProxyVpnService : VpnService() {
             .setOngoing(true)
             .build()
         if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
-            startForeground(1, n)
+            startForeground(1, notification)
         }
     }
 
-    private fun stopVpn() {
-        generation++
-        watching = false
-        if (hevStarted) {
-            try { TProxyService.TProxyStopService() } catch (_: Throwable) {}
-            hevStarted = false
+    private fun requestStop() {
+        val activeWorker = worker
+        if (activeWorker == null) {
+            finish(null)
+            return
         }
-        try { bridge?.stop() } catch (_: Throwable) {}
-        bridge = null
-        try { tun?.close() } catch (_: Throwable) {}
-        tun = null
+        if (stopRequested) return
+        stopRequested = true
+        setStatus("Disconnecting")
+        activeWorker.interrupt()
+    }
+
+    private fun finish(failure: String?) {
+        worker = null
+        if (restartRequested) {
+            restartRequested = false
+            launch()
+            return
+        }
+        usingDnsOverTcp = false
+        error = failure
+        setStatus("Disconnected")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
-        setStatus("Disconnected")
     }
 
     override fun onRevoke() {
-        error = null
-        stopVpn()
+        main.post {
+            restartRequested = false
+            requestStop()
+        }
     }
 
     override fun onDestroy() {
-        if (tun != null) stopVpn()
+        destroyed = true
+        val wasStopping = stopRequested
+        stopRequested = true
+        if (!wasStopping) worker?.interrupt()
+        if (worker != null) {
+            usingDnsOverTcp = false
+            setStatus("Disconnected")
+        }
         super.onDestroy()
     }
 }

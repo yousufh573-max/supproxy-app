@@ -1,6 +1,7 @@
 package com.supproxy.app
 
 import android.content.Context
+import android.content.Intent
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -42,6 +43,15 @@ object Store {
         l.forEach { arr.put(it.toJson()) }
         p(c).edit().putString("saved", arr.toString()).apply()
     }
+
+    fun routablePackages(c: Context): List<String> =
+        c.packageManager.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+            .map { it.activityInfo.packageName }
+            .distinct()
+            .filter { it != c.packageName }
+
+    fun dnsOverTcp(c: Context) = p(c).getBoolean("dns_over_tcp", false)
+    fun setDnsOverTcp(c: Context, enabled: Boolean) = p(c).edit().putBoolean("dns_over_tcp", enabled).apply()
 
     fun excluded(c: Context): MutableSet<String> = HashSet(p(c).getStringSet("excluded", emptySet())!!)
     fun setExcluded(c: Context, s: Set<String>) = p(c).edit().putStringSet("excluded", HashSet(s)).apply()

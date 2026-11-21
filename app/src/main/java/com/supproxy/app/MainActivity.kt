@@ -407,9 +407,7 @@ class MainActivity : Activity() {
     }
 
     private fun reconnect() {
-        startService(Intent(this, ProxyVpnService::class.java).setAction(ProxyVpnService.ACTION_STOP))
-        ui.postDelayed({ if (ProxyVpnService.status == "Disconnected") startVpn() }, 900)
-        toast("Reconnecting...")
+        startService(Intent(this, ProxyVpnService::class.java).setAction(ProxyVpnService.ACTION_RESTART))
     }
 
     private fun refreshHome() {
@@ -428,8 +426,10 @@ class MainActivity : Activity() {
             text = when {
                 connected -> "Disconnect"
                 disconnected -> "Connect"
+                state == "Disconnecting" -> "Disconnecting…"
                 else -> "Cancel"
             }
+            isEnabled = state != "Disconnecting"
             background = ripple(if (disconnected) ACCENT else SURFACE2, 14, if (disconnected) 0 else OUTLINE)
             setTextColor(if (disconnected) ON_ACCENT else TEXT)
         }
@@ -459,6 +459,11 @@ class MainActivity : Activity() {
         val down = downloadTv ?: return
         val up = uploadTv ?: return
         if (ProxyVpnService.status != "Connected") {
+            down.text = "—"
+            up.text = "—"
+            return
+        }
+        if (ProxyVpnService.usingDnsOverTcp) {
             down.text = "—"
             up.text = "—"
             return
@@ -782,10 +787,7 @@ class MainActivity : Activity() {
 
         Thread {
             val pm = packageManager
-            val apps = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
-                .map { it.activityInfo.packageName }
-                .distinct()
-                .filter { it != packageName }
+            val apps = Store.routablePackages(this)
                 .mapNotNull {
                     try {
                         val ai = pm.getApplicationInfo(it, 0)
@@ -869,6 +871,13 @@ class MainActivity : Activity() {
                 contentDescription = "Auto reconnect"
                 isChecked = Store.autoReconnect(this@MainActivity)
                 setOnCheckedChangeListener { _, v -> Store.setAutoReconnect(this@MainActivity, v) }
+            }, null))
+        c1.addView(divider(), lp(MATCH, dp(1)))
+        c1.addView(row("DNS over TCP", "Route DNS through the proxy to 1.1.1.1 over TCP. Changes apply on reconnect.",
+            Switch(this).apply {
+                contentDescription = "DNS over TCP"
+                isChecked = Store.dnsOverTcp(this@MainActivity)
+                setOnCheckedChangeListener { _, enabled -> Store.setDnsOverTcp(this@MainActivity, enabled) }
             }, null))
         c1.addView(divider(), lp(MATCH, dp(1)))
         c1.addView(row("Connection mode", "Choose what routes through the proxy",

@@ -36,6 +36,17 @@ jobs:
         with:
           gradle-version: 8.7
 
+      - name: Install pinned tun2proxy Android libraries
+        run: |
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/tun2proxy/tun2proxy/releases/download/v0.8.7/tun2proxy-android-libs.zip \
+            -o "$RUNNER_TEMP/tun2proxy.zip"
+          echo "e85d311ade195fe90d6b018585bb86f2f0d8c5ec61f52603b016a6a5d78c6cc4  $RUNNER_TEMP/tun2proxy.zip" | sha256sum --check
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            mkdir -p "app/src/main/jniLibs/$abi"
+            unzip -p "$RUNNER_TEMP/tun2proxy.zip" "tun2proxy-android-libs/$abi/libtun2proxy.so" > "app/src/main/jniLibs/$abi/libtun2proxy.so"
+          done
+
       - name: Build debug APK
         run: gradle assembleDebug --no-daemon
 
