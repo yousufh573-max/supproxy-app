@@ -46,7 +46,13 @@ class ProxyVpnService : VpnService() {
         if (a != ACTION_START && a != SERVICE_INTERFACE) return START_NOT_STICKY
         if (tun != null) return START_NOT_STICKY
 
-        showForeground()
+        try {
+            showForeground()
+        } catch (e: RuntimeException) {
+            error = "Could not start the VPN service: ${e.message ?: e.javaClass.simpleName}"
+            stopVpn()
+            return START_NOT_STICKY
+        }
         val pr = Store.active(this)
         if (pr.host.isBlank()) {
             error = "No server configured"
@@ -101,8 +107,10 @@ class ProxyVpnService : VpnService() {
                 val f = File(filesDir, "tproxy.yaml")
                 f.writeText(config(th, tp, tu, tpw, !http))
                 cfg = f
-                TProxyService.TProxyStartService(f.absolutePath, pfd.fd)
-                hevStarted = true
+                hevStarted = TProxyService.TProxyStartService(f.absolutePath, pfd.fd)
+                if (!hevStarted || !TProxyService.TProxyIsRunning()) {
+                    throw IOException("Could not start the proxy tunnel")
+                }
 
                 setStatus("Connected")
                 showForeground("Connected to ${pr.host}:${pr.port}")
@@ -144,7 +152,7 @@ class ProxyVpnService : VpnService() {
                     if (fails == 2) setStatus("Reconnecting")
                 } else {
                     if (fails >= 2) {
-                        restartTunnel()
+                        if (!restartTunnel(gen)) return@Thread
                         setStatus("Connected")
                     }
                     fails = 0
@@ -153,14 +161,24 @@ class ProxyVpnService : VpnService() {
         }.start()
     }
 
-    private fun restartTunnel() {
+    private fun restartTunnel(gen: Int): Boolean {
         try {
             TProxyService.TProxyStopService()
             Thread.sleep(400)
-            val t = tun ?: return
-            val f = cfg ?: return
-            TProxyService.TProxyStartService(f.absolutePath, t.fd)
-        } catch (_: Throwable) {}
+            if (gen != generation) return false
+            val t = tun ?: return false
+            val f = cfg ?: return false
+            if (!TProxyService.TProxyStartService(f.absolutePath, t.fd)) {
+                throw IOException("Could not restart the proxy tunnel")
+            }
+            return true
+        } catch (e: Exception) {
+            if (gen == generation) {
+                error = e.message ?: "Could not restart the proxy tunnel"
+                stopVpn()
+            }
+            return false
+        }
     }
 
     private fun setStatus(s: String) {

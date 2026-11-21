@@ -11,7 +11,15 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Fetch hev-socks5-tunnel (with submodules)
-        run: git clone --recursive --depth 1 --shallow-submodules https://github.com/heiher/hev-socks5-tunnel app/src/main/jni/hev-socks5-tunnel
+        working-directory: app/src/main/jni
+        run: |
+          # Keep this revision in sync with the native declarations in TProxyService.java.
+          git init hev-socks5-tunnel
+          cd hev-socks5-tunnel
+          git remote add origin https://github.com/heiher/hev-socks5-tunnel.git
+          git fetch --depth 1 origin fc3f90040b8d4b537341c96538669a9b2e35d514
+          git checkout --detach FETCH_HEAD
+          git submodule update --init --recursive --depth 1
 
       - uses: actions/setup-java@v4
         with:

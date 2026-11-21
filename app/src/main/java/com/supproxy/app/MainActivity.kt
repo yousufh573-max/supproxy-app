@@ -385,14 +385,24 @@ class MainActivity : Activity() {
             return
         }
         Store.setActive(this, profile)
-        val prep = VpnService.prepare(this)
-        if (prep != null) startActivityForResult(prep, 1) else startVpn()
+        try {
+            val prep = VpnService.prepare(this)
+            if (prep != null) startActivityForResult(prep, 1) else startVpn()
+        } catch (e: RuntimeException) {
+            ProxyVpnService.error = "Could not request VPN permission: ${e.message ?: e.javaClass.simpleName}"
+            refreshHome()
+        }
     }
 
     private fun startVpn() {
         ProxyVpnService.error = null
         ProxyVpnService.status = "Connecting"
-        startForegroundService(Intent(this, ProxyVpnService::class.java).setAction(ProxyVpnService.ACTION_START))
+        try {
+            startForegroundService(Intent(this, ProxyVpnService::class.java).setAction(ProxyVpnService.ACTION_START))
+        } catch (e: RuntimeException) {
+            ProxyVpnService.status = "Disconnected"
+            ProxyVpnService.error = "Could not start the VPN service: ${e.message ?: e.javaClass.simpleName}"
+        }
         refreshHome()
     }
 
