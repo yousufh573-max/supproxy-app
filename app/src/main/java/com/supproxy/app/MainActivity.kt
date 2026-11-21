@@ -12,9 +12,11 @@ import android.content.pm.PackageManager
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
-import android.graphics.RectF
+import android.graphics.Path
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
+import android.content.res.ColorStateList
 import android.net.Uri
 import android.net.VpnService
 import android.os.Build
@@ -29,6 +31,7 @@ import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -44,67 +47,97 @@ import java.net.Socket
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 
-private val BG = Color.parseColor("#12151F")
-private val SURFACE = Color.parseColor("#1B2030")
-private val SURFACE2 = Color.parseColor("#252C42")
-private val ACCENT = Color.parseColor("#6C5CE7")
-private val GREEN = Color.parseColor("#2ED47A")
-private val AMBER = Color.parseColor("#F2B84B")
-private val RED = Color.parseColor("#FF6B7A")
-private val TEXT = Color.parseColor("#F2F4FA")
-private val MUTED = Color.parseColor("#8D96AD")
+private val BG = Color.parseColor("#F7F7F4")
+private val SURFACE = Color.parseColor("#FFFFFF")
+private val SURFACE2 = Color.parseColor("#F0F0EC")
+private val OUTLINE = Color.parseColor("#DADBD5")
+private val ACCENT = Color.parseColor("#5145AF")
+private const val ON_ACCENT = Color.WHITE
+private val GREEN = Color.parseColor("#176448")
+private val AMBER = Color.parseColor("#825500")
+private val RED = Color.parseColor("#B32642")
+private val TEXT = Color.parseColor("#1C2030")
+private val MUTED = Color.parseColor("#555C6C")
 private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
 private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
 
-private class PowerButton(c: Context) : View(c) {
-    var state = 0 // 0 off, 1 busy, 2 on
-        set(v) { field = v; invalidate() }
-    private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+private class TunnelGraphic(context: Context) : View(context) {
+    var tint = ACCENT
+        set(value) { field = value; invalidate() }
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val shield = Path()
 
-    override fun onDraw(cv: Canvas) {
-        val cx = width / 2f
-        val cy = height / 2f
-        val r = minOf(cx, cy)
-        val col = when (state) { 2 -> GREEN; 1 -> AMBER; else -> ACCENT }
-        val rgb = col and 0x00FFFFFF
-        p.style = Paint.Style.FILL
-        p.color = rgb or 0x22000000
-        cv.drawCircle(cx, cy, r, p)
-        p.color = rgb or 0x44000000
-        cv.drawCircle(cx, cy, r * 0.82f, p)
-        p.color = col
-        cv.drawCircle(cx, cy, r * 0.62f, p)
-        p.color = Color.WHITE
-        p.style = Paint.Style.STROKE
-        p.strokeWidth = r * 0.07f
-        p.strokeCap = Paint.Cap.ROUND
-        val ir = r * 0.24f
-        val oy = r * 0.03f
-        cv.drawArc(RectF(cx - ir, cy - ir + oy, cx + ir, cy + ir + oy), -55f, 290f, false, p)
-        cv.drawLine(cx, cy - ir * 1.1f, cx, cy - ir * 0.1f, p)
+    init { importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO }
+
+    override fun onDraw(canvas: Canvas) {
+        canvas.save()
+        canvas.translate(width / 2f, height / 2f)
+        val scale = minOf(width, height) / 120f
+        canvas.scale(scale, scale)
+
+        paint.style = Paint.Style.STROKE
+        paint.color = tint
+        paint.alpha = 62
+        paint.strokeWidth = 1f
+        canvas.drawCircle(0f, 0f, 56f, paint)
+        canvas.drawCircle(0f, 0f, 46f, paint)
+        canvas.drawLine(-86f, 0f, -56f, 0f, paint)
+        canvas.drawLine(56f, 0f, 86f, 0f, paint)
+
+        paint.style = Paint.Style.FILL
+        paint.alpha = 38
+        canvas.drawCircle(0f, 0f, 36f, paint)
+        paint.alpha = 220
+        canvas.drawCircle(-56f, 0f, 2.5f, paint)
+        canvas.drawCircle(56f, 0f, 2.5f, paint)
+
+        shield.rewind()
+        shield.moveTo(0f, -20f)
+        shield.lineTo(17f, -13f)
+        shield.lineTo(17f, -2f)
+        shield.cubicTo(17f, 9f, 9f, 17f, 0f, 22f)
+        shield.cubicTo(-9f, 17f, -17f, 9f, -17f, -2f)
+        shield.lineTo(-17f, -13f)
+        shield.close()
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 2f
+        paint.strokeJoin = Paint.Join.ROUND
+        canvas.drawPath(shield, paint)
+        paint.strokeCap = Paint.Cap.ROUND
+        if (tint == GREEN) {
+            canvas.drawLine(-7f, 0f, -2f, 5f, paint)
+            canvas.drawLine(-2f, 5f, 8f, -5f, paint)
+        } else {
+            canvas.drawCircle(0f, 1f, 5f, paint)
+        }
+        canvas.restore()
     }
 }
-
 class MainActivity : Activity() {
 
     private lateinit var content: FrameLayout
-    private lateinit var navItems: List<TextView>
+    private lateinit var navItems: List<Button>
     private var tab = 0
     private var profile = Profile()
     private val ui = Handler(Looper.getMainLooper())
 
     // Home screen views (null while another tab is showing)
-    private var power: PowerButton? = null
+    private var tunnel: TunnelGraphic? = null
+    private var connectButton: Button? = null
     private var statusTv: TextView? = null
     private var subTv: TextView? = null
-    private var statsTv: TextView? = null
+    private var downloadTv: TextView? = null
+    private var uploadTv: TextView? = null
     private var ipVals: Map<String, TextView> = emptyMap()
-    private var ipLoaded = false
+    private var ipDetails: Map<String, String>? = null
+    private var ipLookupInProgress = false
+    private var ipLookupGeneration = 0
     private var fName: EditText? = null
     private var fHost: EditText? = null
     private var fPort: EditText? = null
     private var fUser: EditText? = null
     private var fPass: EditText? = null
+    private var authSwitch: Switch? = null
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) { refreshHome() }
@@ -134,7 +167,7 @@ class MainActivity : Activity() {
         text = t
         textSize = sp
         setTextColor(color)
-        if (bold) typeface = Typeface.DEFAULT_BOLD
+        if (bold) typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
     }
 
     private fun vbox(pad: Int = 0) = LinearLayout(this).apply {
@@ -143,16 +176,19 @@ class MainActivity : Activity() {
     }
 
     private fun card() = vbox(16).apply {
-        background = round(SURFACE, 20)
+        background = round(SURFACE, 20, OUTLINE)
         layoutParams = LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(14) }
     }
 
     private fun page(title: String, sub: String) = vbox(20).also {
-        it.addView(tv(title, 28f, TEXT, true))
-        it.addView(tv(sub, 14f, MUTED))
+        it.addView(tv(title, 32f, TEXT, true))
+        it.addView(tv(sub, 14f, MUTED), lp(MATCH, WRAP).apply { topMargin = dp(4) })
     }
 
-    private fun scroll(inner: View) = ScrollView(this).apply { addView(inner) }
+    private fun scroll(inner: View) = ScrollView(this).apply {
+        isFillViewport = true
+        addView(inner)
+    }
 
     private fun field(hint: String, value: String, type: Int = InputType.TYPE_CLASS_TEXT) = EditText(this).apply {
         setHint(hint)
@@ -162,19 +198,41 @@ class MainActivity : Activity() {
         textSize = 16f
         inputType = type
         setSingleLine(true)
-        background = round(SURFACE2, 14)
-        setPadding(dp(14), dp(12), dp(14), dp(12))
+        minHeight = dp(50)
+        setPadding(dp(12), dp(10), dp(12), dp(10))
+        background = round(BG, 12, OUTLINE)
+        setOnFocusChangeListener { _, focused ->
+            background = round(BG, 12, if (focused) ACCENT else OUTLINE)
+        }
     }
 
-    private fun button(t: String, filled: Boolean, onClick: () -> Unit) =
-        tv(t, 15f, if (filled) Color.WHITE else ACCENT, true).apply {
-            gravity = Gravity.CENTER
-            setPadding(0, dp(13), 0, dp(13))
-            background = round(if (filled) ACCENT else SURFACE2, 14)
-            setOnClickListener { onClick() }
-        }
+    private fun labeledField(label: String, input: EditText) = vbox().apply {
+        input.id = View.generateViewId()
+        addView(tv(label, 13f, MUTED, true).apply { labelFor = input.id })
+        addView(input, lp(MATCH, WRAP).apply { topMargin = dp(5) })
+    }
 
-    private fun divider() = View(this).apply { setBackgroundColor(SURFACE2) }
+    private fun ripple(color: Int, radius: Int, border: Int = 0) = RippleDrawable(
+        ColorStateList.valueOf(0x225145AF), round(color, radius, border), null
+    )
+
+    private fun button(t: String, filled: Boolean, onClick: () -> Unit) = Button(this).apply {
+        text = t
+        textSize = 15f
+        isAllCaps = false
+        letterSpacing = 0f
+        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        setTextColor(if (filled) ON_ACCENT else ACCENT)
+        gravity = Gravity.CENTER
+        minimumHeight = dp(48)
+        minimumWidth = 0
+        stateListAnimator = null
+        setPadding(dp(12), dp(8), dp(12), dp(8))
+        background = ripple(if (filled) ACCENT else SURFACE2, 12)
+        setOnClickListener { onClick() }
+    }
+
+    private fun divider() = View(this).apply { setBackgroundColor(OUTLINE) }
 
     private fun row(title: String, desc: String, trailing: View?, onClick: (() -> Unit)?): View {
         val r = LinearLayout(this).apply {
@@ -218,18 +276,21 @@ class MainActivity : Activity() {
         content = FrameLayout(this)
         root.addView(content, lp(MATCH, 0, 1f))
 
+        root.addView(divider(), lp(MATCH, dp(1)))
         val nav = LinearLayout(this).apply {
             setBackgroundColor(SURFACE)
-            setPadding(dp(8), dp(8), dp(8), dp(8))
+            setPadding(dp(12), dp(8), dp(12), dp(8))
         }
-        navItems = listOf("Home", "Saved", "Apps", "Settings").mapIndexed { i, n ->
-            tv(n, 14f, MUTED, true).apply {
-                gravity = Gravity.CENTER
-                setPadding(0, dp(10), 0, dp(10))
-                setOnClickListener { show(i) }
+        val navIcons = listOf(R.drawable.nav_home, R.drawable.nav_profiles, R.drawable.nav_apps, R.drawable.nav_settings)
+        navItems = listOf("Home", "Profiles", "Apps", "Settings").mapIndexed { index, label ->
+            button(label, false) { if (tab != index) show(index) }.apply {
+                textSize = 13f
+                setPadding(dp(3), dp(7), dp(3), dp(7))
+                setCompoundDrawablesWithIntrinsicBounds(0, navIcons[index], 0, 0)
+                compoundDrawablePadding = dp(3)
             }
         }
-        navItems.forEach { nav.addView(it, lp(0, WRAP, 1f).apply { setMargins(dp(4), 0, dp(4), 0) }) }
+        navItems.forEach { nav.addView(it, lp(0, WRAP, 1f).apply { setMargins(dp(2), 0, dp(2), 0) }) }
         root.addView(nav, MATCH, WRAP)
         setContentView(root)
 
@@ -268,12 +329,17 @@ class MainActivity : Activity() {
     private fun show(i: Int) {
         collectForm()
         tab = i
-        power = null; statusTv = null; subTv = null; statsTv = null
+        tunnel = null; connectButton = null; statusTv = null; subTv = null
+        downloadTv = null; uploadTv = null
         fName = null; fHost = null; fPort = null; fUser = null; fPass = null
+        authSwitch = null
         ipVals = emptyMap()
         navItems.forEachIndexed { k, v ->
-            v.setTextColor(if (k == i) Color.WHITE else MUTED)
-            v.background = if (k == i) round(ACCENT, 14) else null
+            v.isSelected = k == i
+            val color = if (k == i) ACCENT else MUTED
+            v.setTextColor(color)
+            v.compoundDrawableTintList = ColorStateList.valueOf(color)
+            v.background = ripple(if (k == i) SURFACE2 else SURFACE, 12, if (k == i) OUTLINE else 0)
         }
         content.removeAllViews()
         content.addView(
@@ -303,8 +369,21 @@ class MainActivity : Activity() {
             return
         }
         collectForm()
-        if (profile.host.isBlank() || profile.port !in 1..65535) { toast("Enter a valid server and port"); return }
-        if (profile.auth && profile.user.isBlank()) { toast("Enter the username"); return }
+        if (profile.host.isBlank()) {
+            fHost?.error = "Enter a server address"
+            fHost?.requestFocus()
+            return
+        }
+        if (profile.port !in 1..65535) {
+            fPort?.error = "Enter a port from 1 to 65535"
+            fPort?.requestFocus()
+            return
+        }
+        if (profile.auth && profile.user.isBlank()) {
+            fUser?.error = "Enter the username"
+            fUser?.requestFocus()
+            return
+        }
         Store.setActive(this, profile)
         val prep = VpnService.prepare(this)
         if (prep != null) startActivityForResult(prep, 1) else startVpn()
@@ -324,42 +403,77 @@ class MainActivity : Activity() {
     }
 
     private fun refreshHome() {
-        val s = statusTv ?: return
-        val st = ProxyVpnService.status
-        power?.state = when (st) { "Connected" -> 2; "Connecting", "Reconnecting" -> 1; else -> 0 }
-        s.text = when (st) { "Connecting" -> "Connecting..."; "Reconnecting" -> "Reconnecting..."; else -> st }
-        val err = ProxyVpnService.error
+        val state = ProxyVpnService.status
+        val connected = state == "Connected"
+        val disconnected = state == "Disconnected"
+        val stateColor = when {
+            connected -> GREEN
+            disconnected -> ACCENT
+            else -> AMBER
+        }
+        tunnel?.tint = stateColor
+        statusTv?.text = state
+        statusTv?.setTextColor(stateColor)
+        connectButton?.apply {
+            text = when {
+                connected -> "Disconnect"
+                disconnected -> "Connect"
+                else -> "Cancel"
+            }
+            background = ripple(if (disconnected) ACCENT else SURFACE2, 14, if (disconnected) 0 else OUTLINE)
+            setTextColor(if (disconnected) ON_ACCENT else TEXT)
+        }
+
+        val error = ProxyVpnService.error
         subTv?.apply {
-            if (st == "Disconnected" && err != null) {
-                text = "Error: $err"
-                setTextColor(RED)
-            } else {
-                setTextColor(MUTED)
-                text = if (st == "Disconnected") "Tap the button to connect"
-                else "${profile.host}:${profile.port} \u00B7 ${profile.protocol}"
+            setTextColor(if (disconnected && error != null) RED else MUTED)
+            text = when {
+                disconnected && error != null -> error
+                disconnected && profile.host.isBlank() -> "Enter a proxy server below to connect"
+                disconnected -> "Ready to connect"
+                else -> "${profile.host}:${profile.port} · ${profile.protocol}"
             }
         }
-        if (st == "Connected") {
-            if (!ipLoaded) { ipLoaded = true; lookupIp() }
-        } else {
-            ipLoaded = false
-            ipVals.values.forEach { it.text = "--" }
+        if (!connected) {
+            ipDetails = null
+            ipLookupInProgress = false
+            ipLookupGeneration++
+        } else if (ipVals.isNotEmpty() && ipDetails == null && !ipLookupInProgress) {
+            lookupIp()
         }
+        renderIp()
         updateStats()
     }
 
     private fun updateStats() {
-        val t = statsTv ?: return
-        if (ProxyVpnService.status != "Connected") { t.text = ""; return }
+        val down = downloadTv ?: return
+        val up = uploadTv ?: return
+        if (ProxyVpnService.status != "Connected") {
+            down.text = "—"
+            up.text = "—"
+            return
+        }
         try {
-            val st = TProxyService.TProxyGetStats()
-            t.text = "Down ${fmt(st[3])}   \u00B7   Up ${fmt(st[1])}"
-        } catch (_: Throwable) {}
+            val stats = TProxyService.TProxyGetStats()
+            down.text = fmt(stats[3])
+            up.text = fmt(stats[1])
+        } catch (_: Throwable) {
+            down.text = "—"
+            up.text = "—"
+        }
+    }
+
+    private fun renderIp() {
+        ipVals.forEach { (label, value) ->
+            value.text = ipDetails?.get(label)?.takeIf { it.isNotBlank() }
+                ?: if (ipLookupInProgress && label == "IP address") "Checking…" else "—"
+        }
     }
 
     private fun lookupIp() {
         val pr = Store.active(this)
-        ipVals["IP address"]?.text = "Checking..."
+        val generation = ++ipLookupGeneration
+        ipLookupInProgress = true
         Thread {
             var res: Map<String, String>? = null
             try {
@@ -384,11 +498,10 @@ class MainActivity : Activity() {
                 )
             } catch (_: Throwable) {}
             runOnUiThread {
-                val r = res
-                ipVals.forEach { (k, v) ->
-                    v.text = if (r == null) (if (k == "IP address") "Unavailable" else "--")
-                    else r[k].orEmpty().ifBlank { "--" }
-                }
+                if (generation != ipLookupGeneration || ProxyVpnService.status != "Connected") return@runOnUiThread
+                ipLookupInProgress = false
+                ipDetails = res ?: mapOf("IP address" to "Unavailable")
+                renderIp()
             }
         }.start()
     }
@@ -414,55 +527,80 @@ class MainActivity : Activity() {
             profile.auth = true
             fUser?.setText(user)
             fPass?.setText(pass)
-            collectForm()
-            show(0)
+            authSwitch?.isChecked = true
         }
     }
 
     // ---------- Home ----------
 
     private fun homeView(): View {
-        val p = vbox(20)
-        val head = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-        head.addView(ImageView(this).apply { setImageResource(R.drawable.logo) }, lp(dp(38), dp(38)))
-        head.addView(tv("Supproxy", 22f, TEXT, true).apply { setPadding(dp(12), 0, 0, 0) }, lp(0, WRAP, 1f))
-        p.addView(head)
-
-        power = PowerButton(this).apply { setOnClickListener { toggle() } }
-        p.addView(power, lp(dp(200), dp(200)).apply { gravity = Gravity.CENTER_HORIZONTAL; topMargin = dp(24) })
-        statusTv = tv("", 24f, TEXT, true).apply { gravity = Gravity.CENTER; setPadding(0, dp(16), 0, 0) }
-        subTv = tv("", 14f, MUTED).apply { gravity = Gravity.CENTER }
-        statsTv = tv("", 13f, MUTED).apply { gravity = Gravity.CENTER; setPadding(0, dp(6), 0, 0) }
-        p.addView(statusTv, MATCH, WRAP)
-        p.addView(subTv, MATCH, WRAP)
-        p.addView(statsTv, MATCH, WRAP)
-
-        val ipc = card()
-        ipc.addView(tv("Connection details", 13f, MUTED, true))
-        val m = LinkedHashMap<String, TextView>()
-        for (k in listOf("IP address", "Country", "Region", "City", "ISP", "ZIP")) {
-            val r = LinearLayout(this).apply { setPadding(0, dp(8), 0, 0) }
-            r.addView(tv(k, 14f, MUTED), lp(0, WRAP, 1f))
-            val v = tv("--", 14f, TEXT, true).apply { gravity = Gravity.END }
-            m[k] = v
-            r.addView(v, lp(0, WRAP, 2f))
-            ipc.addView(r)
+        val p = vbox(20).apply {
+            isFocusableInTouchMode = true
+            descendantFocusability = ViewGroup.FOCUS_BEFORE_DESCENDANTS
         }
-        ipVals = m
-        p.addView(ipc)
+        val head = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        head.addView(ImageView(this).apply {
+            setImageResource(R.drawable.logo)
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }, lp(dp(42), dp(42)))
+        head.addView(tv("Supproxy", 26f, TEXT, true).apply {
+            setPadding(dp(10), 0, 0, 0)
+        }, lp(0, WRAP, 1f))
+        p.addView(head, lp(MATCH, WRAP))
+
+        val hero = card().apply {
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TL_BR, intArrayOf(BG, SURFACE)
+            ).apply {
+                cornerRadius = dp(24).toFloat()
+                setStroke(dp(1), OUTLINE)
+            }
+        }
+        tunnel = TunnelGraphic(this)
+        hero.addView(tunnel, lp(MATCH, dp(112)))
+        statusTv = tv("", 29f, TEXT, true).apply {
+            gravity = Gravity.CENTER
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        subTv = tv("", 14f, MUTED).apply { gravity = Gravity.CENTER }
+        hero.addView(statusTv, lp(MATCH, WRAP))
+        hero.addView(subTv, lp(MATCH, WRAP).apply { topMargin = dp(4) })
+        connectButton = button("Connect", true) { toggle() }
+        hero.addView(connectButton, lp(MATCH, WRAP).apply { topMargin = dp(16) })
+        p.addView(hero)
+
+        val traffic = LinearLayout(this).apply { isBaselineAligned = false }
+        fun addMetric(label: String, leading: Boolean): TextView {
+            val tile = vbox(12).apply { background = round(SURFACE, 16, OUTLINE) }
+            tile.addView(tv(label, 13f, MUTED))
+            val value = tv("—", 19f, TEXT, true)
+            tile.addView(value, lp(MATCH, WRAP).apply { topMargin = dp(3) })
+            traffic.addView(tile, lp(0, WRAP, 1f).apply {
+                if (leading) marginEnd = dp(8)
+            })
+            return value
+        }
+        downloadTv = addMetric("Received", true)
+        uploadTv = addMetric("Sent", false)
+        p.addView(traffic, lp(MATCH, WRAP).apply { topMargin = dp(10) })
 
         val sc = card()
-        sc.addView(tv("Server", 13f, MUTED, true))
+        sc.addView(tv("Proxy server", 20f, TEXT, true))
         val seg = LinearLayout(this).apply {
             background = round(SURFACE2, 14)
             setPadding(dp(4), dp(4), dp(4), dp(4))
         }
         val opts = listOf("SOCKS5", "HTTP")
         val segViews = opts.map { o ->
-            tv(o, 14f, TEXT, true).apply { gravity = Gravity.CENTER; setPadding(0, dp(10), 0, dp(10)) }
+            button(o, false) {}
         }
         fun paintSeg() {
-            segViews.forEachIndexed { i, v -> v.background = if (opts[i] == profile.protocol) round(ACCENT, 11) else null }
+            segViews.forEachIndexed { i, view ->
+                val selected = opts[i] == profile.protocol
+                view.isSelected = selected
+                view.setTextColor(if (selected) ON_ACCENT else MUTED)
+                view.background = ripple(if (selected) ACCENT else SURFACE2, 9)
+            }
         }
         segViews.forEachIndexed { i, v ->
             v.setOnClickListener { profile.protocol = opts[i]; paintSeg() }
@@ -472,41 +610,39 @@ class MainActivity : Activity() {
         sc.addView(seg, lp(MATCH, WRAP).apply { topMargin = dp(10) })
 
         fName = field("Profile name", profile.name)
-        sc.addView(fName, lp(MATCH, WRAP).apply { topMargin = dp(10) })
+        sc.addView(labeledField("Profile name", requireNotNull(fName)), lp(MATCH, WRAP).apply { topMargin = dp(14) })
 
         fHost = field("proxy.example.com", profile.host, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
         fPort = field("1080", if (profile.port > 0) profile.port.toString() else "", InputType.TYPE_CLASS_NUMBER)
         val hp = LinearLayout(this)
-        hp.addView(fHost, lp(0, WRAP, 1f))
-        hp.addView(fPort, lp(dp(100), WRAP).apply { leftMargin = dp(8) })
+        hp.addView(labeledField("Server address", requireNotNull(fHost)), lp(0, WRAP, 1f))
+        hp.addView(labeledField("Port", requireNotNull(fPort)), lp(dp(84), WRAP).apply { marginStart = dp(8) })
         sc.addView(hp, lp(MATCH, WRAP).apply { topMargin = dp(10) })
 
-        sc.addView(link("Paste server from clipboard").apply {
-            setPadding(0, dp(12), 0, dp(4))
-            setOnClickListener {
-                val cm = getSystemService(ClipboardManager::class.java)
-                val t = cm.primaryClip?.getItemAt(0)?.text?.toString()
-                if (t.isNullOrBlank()) toast("Clipboard is empty") else applyPasted(t)
-            }
-        })
+        sc.addView(button("Paste server", false) {
+            val cm = getSystemService(ClipboardManager::class.java)
+            val text = cm.primaryClip?.getItemAt(0)?.text?.toString()
+            if (text.isNullOrBlank()) toast("Clipboard is empty") else applyPasted(text)
+        }, lp(MATCH, WRAP).apply { topMargin = dp(10) })
 
         val authBox = vbox()
         fUser = field("Username", profile.user)
         fPass = field("Password", profile.pass, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
-        authBox.addView(fUser, lp(MATCH, WRAP).apply { topMargin = dp(6) })
-        authBox.addView(fPass, lp(MATCH, WRAP).apply { topMargin = dp(10) })
-        authBox.addView(link("Show / hide password").apply {
+        authBox.addView(labeledField("Username", requireNotNull(fUser)), lp(MATCH, WRAP).apply { topMargin = dp(6) })
+        authBox.addView(labeledField("Password", requireNotNull(fPass)), lp(MATCH, WRAP).apply { topMargin = dp(10) })
+        authBox.addView(link("Show password").apply {
             setPadding(0, dp(10), 0, 0)
             setOnClickListener {
                 val e = fPass ?: return@setOnClickListener
                 val hidden = (e.inputType and InputType.TYPE_TEXT_VARIATION_PASSWORD) != 0
                 e.inputType = InputType.TYPE_CLASS_TEXT or
                     (if (hidden) InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD else InputType.TYPE_TEXT_VARIATION_PASSWORD)
+                text = if (hidden) "Hide password" else "Show password"
                 e.setSelection(e.text.length)
             }
         })
         authBox.visibility = if (profile.auth) View.VISIBLE else View.GONE
-        sc.addView(Switch(this).apply {
+        authSwitch = Switch(this).apply {
             text = "Requires login"
             textSize = 15f
             setTextColor(TEXT)
@@ -516,7 +652,8 @@ class MainActivity : Activity() {
                 profile.auth = c
                 authBox.visibility = if (c) View.VISIBLE else View.GONE
             }
-        }, lp(MATCH, WRAP).apply { topMargin = dp(4) })
+        }
+        sc.addView(authSwitch, lp(MATCH, WRAP).apply { topMargin = dp(4) })
         sc.addView(authBox)
 
         sc.addView(button("Save profile", false) {
@@ -529,6 +666,26 @@ class MainActivity : Activity() {
             toast("Saved \"${profile.name}\"")
         }, lp(MATCH, WRAP).apply { topMargin = dp(14) })
         p.addView(sc)
+
+        val details = card()
+        details.addView(tv("Connection details", 20f, TEXT, true))
+        val values = linkedMapOf<String, TextView>()
+        for (label in listOf("IP address", "Country", "Region", "City", "ISP", "ZIP")) {
+            val value = tv("—", 14f, TEXT, true).apply { gravity = Gravity.END }
+            val detailRow = LinearLayout(this).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(9), 0, dp(9))
+                addView(tv(label, 14f, MUTED), lp(0, WRAP, 1f))
+                addView(value, lp(0, WRAP, 2f))
+            }
+            details.addView(divider(), lp(MATCH, dp(1)).apply {
+                if (values.isEmpty()) topMargin = dp(10)
+            })
+            details.addView(detailRow, lp(MATCH, WRAP))
+            values[label] = value
+        }
+        ipVals = values
+        p.addView(details)
         p.addView(View(this), lp(MATCH, dp(16)))
 
         refreshHome()
@@ -538,37 +695,46 @@ class MainActivity : Activity() {
     // ---------- Saved ----------
 
     private fun savedView(): View {
-        val p = page("Saved", "Your proxy profiles")
+        val p = page("Profiles", "Load a saved proxy server")
         val list = Store.saved(this)
         if (list.isEmpty()) {
             val c = card()
             c.addView(tv("No saved profiles", 18f, TEXT, true))
-            c.addView(tv("Fill in a server on Home and tap Save profile.", 14f, MUTED))
+            c.addView(tv("Enter a proxy server to save your first profile.", 14f, MUTED))
+            c.addView(button("Set up a server", true) { show(0) },
+                lp(MATCH, WRAP).apply { topMargin = dp(12) })
             p.addView(c)
         }
-        list.forEachIndexed { idx, pr ->
-            val c = card()
-            val r = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-            val t = vbox()
-            t.addView(tv(pr.name, 17f, TEXT, true))
-            t.addView(tv("${pr.protocol} \u00B7 ${pr.host}:${pr.port}", 13f, MUTED))
-            r.addView(t, lp(0, WRAP, 1f))
-            r.addView(link("Delete", RED).apply {
-                setPadding(dp(12), dp(8), dp(12), dp(8))
-                setOnClickListener {
-                    val l = Store.saved(this@MainActivity)
-                    if (idx < l.size) { l.removeAt(idx); Store.setSaved(this@MainActivity, l) }
-                    show(1)
-                }
-            })
-            c.addView(r)
-            c.setOnClickListener {
-                profile = pr.copy()
+        list.forEachIndexed { index, saved ->
+            val profileCard = card()
+            profileCard.addView(tv(saved.name, 19f, TEXT, true))
+            profileCard.addView(tv("${saved.protocol} · ${saved.host}:${saved.port}", 14f, MUTED),
+                lp(MATCH, WRAP).apply { topMargin = dp(4) })
+
+            val actions = LinearLayout(this)
+            actions.addView(button("Load profile", true) {
+                profile = saved.copy()
                 Store.setActive(this, profile)
                 show(0)
-                toast("Loaded ${pr.name}")
-            }
-            p.addView(c)
+                toast("Loaded ${saved.name}")
+            }, lp(0, WRAP, 1f).apply { marginEnd = dp(8) })
+            actions.addView(button("Delete", false) {
+                AlertDialog.Builder(this)
+                    .setTitle("Delete profile?")
+                    .setMessage(saved.name)
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Delete") { _, _ ->
+                        val profiles = Store.saved(this)
+                        if (profiles.getOrNull(index) == saved) {
+                            profiles.removeAt(index)
+                            Store.setSaved(this, profiles)
+                        }
+                        show(1)
+                    }
+                    .show()
+            }.apply { setTextColor(RED) }, lp(WRAP, WRAP))
+            profileCard.addView(actions, lp(MATCH, WRAP).apply { topMargin = dp(14) })
+            p.addView(profileCard)
         }
         return scroll(p)
     }
@@ -620,7 +786,8 @@ class MainActivity : Activity() {
 
             runOnUiThread {
                 fun updateCount() {
-                    count.text = "Installed apps \u00B7 ${apps.count { it.first !in excluded }}/${apps.size} use the proxy"
+                    val selected = if (whole) apps.size else apps.count { it.first !in excluded }
+                    count.text = "$selected of ${apps.size} apps use the proxy"
                 }
                 fun fill(q: String) {
                     listBox.removeAllViews()
@@ -634,7 +801,9 @@ class MainActivity : Activity() {
                         t.addView(tv(a.first, 11f, MUTED))
                         r.addView(t, lp(0, WRAP, 1f))
                         val cb = CheckBox(this).apply {
-                            isChecked = a.first !in excluded
+                            contentDescription = a.second
+                            isEnabled = !whole
+                            isChecked = whole || a.first !in excluded
                             setOnCheckedChangeListener { _, on ->
                                 if (on) excluded.remove(a.first) else excluded.add(a.first)
                                 Store.setExcluded(this@MainActivity, excluded)
@@ -643,19 +812,25 @@ class MainActivity : Activity() {
                         }
                         r.addView(cb)
                         c.addView(r)
-                        c.setOnClickListener { cb.toggle() }
+                        if (!whole) c.setOnClickListener { cb.toggle() }
                         listBox.addView(c)
                     }
                 }
                 updateCount()
-                bar.addView(button("Select all", false) {
-                    excluded.clear(); Store.setExcluded(this, excluded); fill(search.str())
-                    updateCount()
-                }, lp(0, WRAP, 1f).apply { rightMargin = dp(4) })
-                bar.addView(button("Clear all", false) {
-                    excluded.addAll(apps.map { it.first }); Store.setExcluded(this, excluded); fill(search.str())
-                    updateCount()
-                }, lp(0, WRAP, 1f).apply { leftMargin = dp(4) })
+                if (!whole) {
+                    bar.addView(button("Select all", false) {
+                        excluded.clear()
+                        Store.setExcluded(this, excluded)
+                        fill(search.str())
+                        updateCount()
+                    }, lp(0, WRAP, 1f).apply { marginEnd = dp(4) })
+                    bar.addView(button("Clear all", false) {
+                        excluded.addAll(apps.map { it.first })
+                        Store.setExcluded(this, excluded)
+                        fill(search.str())
+                        updateCount()
+                    }, lp(0, WRAP, 1f).apply { marginStart = dp(4) })
+                }
                 search.addTextChangedListener(object : TextWatcher {
                     override fun afterTextChanged(s: Editable?) { fill(s?.toString().orEmpty()) }
                     override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
@@ -673,18 +848,19 @@ class MainActivity : Activity() {
         val p = page("Settings", "Connection and app preferences")
 
         val c1 = card()
-        c1.addView(tv("Connection", 13f, MUTED, true))
+        c1.addView(tv("Connection", 20f, TEXT, true))
         c1.addView(row("Leak protection", "Turn on Always-on VPN and Block connections without VPN in system settings",
             link("Configure")) {
             try { startActivity(Intent(Settings.ACTION_VPN_SETTINGS)) } catch (_: Throwable) { toast("Open Settings > Network > VPN") }
         })
-        c1.addView(divider(), lp(MATCH, 1))
+        c1.addView(divider(), lp(MATCH, dp(1)))
         c1.addView(row("Auto reconnect", "Recover the tunnel automatically if the proxy drops",
             Switch(this).apply {
+                contentDescription = "Auto reconnect"
                 isChecked = Store.autoReconnect(this@MainActivity)
                 setOnCheckedChangeListener { _, v -> Store.setAutoReconnect(this@MainActivity, v) }
             }, null))
-        c1.addView(divider(), lp(MATCH, 1))
+        c1.addView(divider(), lp(MATCH, dp(1)))
         c1.addView(row("Connection mode", "Choose what routes through the proxy",
             link(if (Store.wholePhone(this)) "Whole phone" else "Selected apps")) {
             AlertDialog.Builder(this).setTitle("Connection mode")
@@ -694,7 +870,7 @@ class MainActivity : Activity() {
                     show(3)
                 }.show()
         })
-        c1.addView(divider(), lp(MATCH, 1))
+        c1.addView(divider(), lp(MATCH, dp(1)))
         val battOk = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
         c1.addView(row("Background stability", "Allow unrestricted battery use so the tunnel stays alive",
             link(if (battOk) "OK" else "Fix", if (battOk) GREEN else ACCENT)) {
@@ -709,10 +885,10 @@ class MainActivity : Activity() {
         p.addView(c1)
 
         val c2 = card()
-        c2.addView(tv("About", 13f, MUTED, true))
+        c2.addView(tv("About", 20f, TEXT, true))
         val n = Store.saved(this).size
         c2.addView(row("Saved profiles", "$n profile(s) saved on this device", link(if (n == 0) "Empty" else "View")) { show(1) })
-        c2.addView(divider(), lp(MATCH, 1))
+        c2.addView(divider(), lp(MATCH, dp(1)))
         c2.addView(row("Privacy policy", "How routing and local storage are handled", link(">")) {
             info("Privacy policy",
                 "Supproxy stores your proxy profiles and settings only on this device. It has no accounts, " +
@@ -720,13 +896,13 @@ class MainActivity : Activity() {
                     "and that server's operator can see it. The Home screen's connection details are fetched " +
                     "from ipwho.is through your proxy.\n\nProxy passwords are kept in the app's private storage.")
         })
-        c2.addView(divider(), lp(MATCH, 1))
+        c2.addView(divider(), lp(MATCH, dp(1)))
         c2.addView(row("Terms of use", "Acceptable use and your responsibilities", link(">")) {
             info("Terms of use",
                 "Use Supproxy only with proxy servers you are allowed to use, and in line with the law and the " +
                     "terms of your network and proxy provider. The app is provided as is, without warranty.")
         })
-        c2.addView(divider(), lp(MATCH, 1))
+        c2.addView(divider(), lp(MATCH, dp(1)))
         c2.addView(row("App version", "Android 8+ \u00B7 HTTP and SOCKS5 client", link("1.0"), null))
         p.addView(c2)
 
