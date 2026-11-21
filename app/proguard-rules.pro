@@ -1,0 +1,2 @@
+-keep class hev.htproxy.TProxyService { native <methods>; }
+-keep class com.github.shadowsocks.bg.Tun2proxy { native <methods>; }

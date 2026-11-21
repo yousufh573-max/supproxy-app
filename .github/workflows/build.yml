@@ -3,12 +3,23 @@ name: Build APK
 on:
   push:
   workflow_dispatch:
+    inputs:
+      production:
+        description: Build a production-signed APK using the protected production environment
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    environment: ${{ inputs.production && 'production' || 'debug' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Fetch hev-socks5-tunnel (with submodules)
         working-directory: app/src/main/jni
@@ -48,10 +59,35 @@ jobs:
           done
 
       - name: Build debug APK
+        if: ${{ !inputs.production }}
         run: gradle assembleDebug --no-daemon
 
-      - name: Rename APK
+      - name: Prepare debug APK
+        if: ${{ !inputs.production }}
         run: cp app/build/outputs/apk/debug/app-debug.apk Supproxy.apk
+
+      - name: Build and verify production APK
+        if: ${{ inputs.production }}
+        env:
+          KEYSTORE_BASE64: ${{ secrets.SUPPROXY_KEYSTORE_BASE64 }}
+          SUPPROXY_STORE_PASSWORD: ${{ secrets.SUPPROXY_STORE_PASSWORD }}
+          SUPPROXY_KEY_ALIAS: ${{ secrets.SUPPROXY_KEY_ALIAS }}
+          SUPPROXY_KEY_PASSWORD: ${{ secrets.SUPPROXY_KEY_PASSWORD }}
+          SIGNING_CERT_SHA256: ${{ secrets.SUPPROXY_SIGNING_CERT_SHA256 }}
+        run: |
+          umask 077
+          export SUPPROXY_KEYSTORE="$(mktemp "$RUNNER_TEMP/supproxy-signing.XXXXXXXX")"
+          trap 'rm -f -- "$SUPPROXY_KEYSTORE"' EXIT
+          test -n "$KEYSTORE_BASE64"
+          test -n "$SIGNING_CERT_SHA256"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$SUPPROXY_KEYSTORE"
+          gradle assembleRelease --no-daemon
+          apk=app/build/outputs/apk/release/app-release.apk
+          actual=$("$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --print-certs "$apk" |
+            awk '/Signer #1 certificate SHA-256 digest:/ { print $NF }')
+          expected=$(printf '%s' "$SIGNING_CERT_SHA256" | tr -d ':' | tr '[:upper:]' '[:lower:]')
+          test "$actual" = "$expected"
+          cp "$apk" Supproxy.apk
 
       - uses: actions/upload-artifact@v4
         with:

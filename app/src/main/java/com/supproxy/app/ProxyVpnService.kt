@@ -7,14 +7,15 @@ import android.app.PendingIntent
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import com.github.shadowsocks.bg.Tun2proxy
 import hev.htproxy.TProxyService
-import java.io.File
 import java.io.IOException
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -39,6 +40,12 @@ class ProxyVpnService : VpnService() {
         @Volatile var status = "Disconnected"
         @Volatile var error: String? = null
         @Volatile var usingDnsOverTcp = false
+        @Volatile var systemAlwaysOn: Boolean? = null
+        @Volatile var systemLockdown: Boolean? = null
+        @Volatile var sessionProfile: Profile? = null
+            private set
+        @Volatile var routedPackages: Set<String>? = null
+            private set
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -62,6 +69,8 @@ class ProxyVpnService : VpnService() {
                 }
             }
             ACTION_START, SERVICE_INTERFACE -> if (worker == null) launch()
+            null -> if (intent != null && worker == null &&
+                (Build.VERSION.SDK_INT < 29 || isAlwaysOn)) launch()
         }
         return START_NOT_STICKY
     }
@@ -74,6 +83,10 @@ class ProxyVpnService : VpnService() {
             return
         }
 
+        if (Build.VERSION.SDK_INT >= 29) {
+            systemAlwaysOn = isAlwaysOn
+            systemLockdown = isLockdownEnabled
+        }
         error = null
         stopRequested = false
         setStatus("Connecting")
@@ -84,7 +97,7 @@ class ProxyVpnService : VpnService() {
             } catch (e: InterruptedException) {
                 if (!stopRequested) failure = "VPN startup interrupted"
             } catch (e: Exception) {
-                if (!stopRequested) failure = e.message ?: e.javaClass.simpleName
+                if (!stopRequested) failure = if (e is IOException) e.message else "Could not start or maintain the VPN"
             } catch (_: LinkageError) {
                 if (!stopRequested) failure = "Could not load the native tunnel engine"
             } finally {
@@ -94,8 +107,15 @@ class ProxyVpnService : VpnService() {
     }
 
     private fun runVpn() {
+        java.io.File(filesDir, "tproxy.yaml").delete()
         val profile = Store.active(this)
+        sessionProfile = profile
+        if (Store.storageUnavailable) throw IOException("Encrypted profile storage is unavailable")
         if (profile.host.isBlank() || profile.port !in 1..65535) throw IOException("Enter a valid proxy server and port")
+        if (profile.auth && profile.protocol == "SOCKS5" &&
+            (profile.user.toByteArray().size !in 1..255 || profile.pass.toByteArray().size !in 1..255)) {
+            throw IOException("SOCKS5 login must use 1–255 bytes per field")
+        }
         val dnsOverTcp = Store.dnsOverTcp(this)
         val builder = vpnBuilder(dnsOverTcp)
         var address = waitForProxy(profile)
@@ -105,15 +125,16 @@ class ProxyVpnService : VpnService() {
         usingDnsOverTcp = dnsOverTcp
         descriptor.use { tun ->
             while (!stopRequested) {
-                val bridge = if (profile.protocol == "HTTP") {
-                    HttpBridge(address, profile.port, profile.user.takeIf { profile.auth }, profile.pass)
+                val bridge = if (profile.protocol != "SOCKS5") {
+                    HttpBridge(address, profile.port, profile.user.takeIf { profile.auth }, profile.pass,
+                        profile.host.takeIf { profile.protocol == "HTTPS" })
                 } else null
                 try {
                     bridge?.start()
                     val host = if (bridge == null) address else "127.0.0.1"
                     val port = bridge?.localPort ?: profile.port
-                    val user = profile.user.takeIf { profile.auth && bridge == null }.orEmpty()
-                    val password = profile.pass.takeIf { user.isNotEmpty() }.orEmpty()
+                    val user = bridge?.localUser ?: profile.user.takeIf { profile.auth }.orEmpty()
+                    val password = bridge?.localPassword ?: profile.pass.takeIf { profile.auth }.orEmpty()
 
                     if (dnsOverTcp) {
                         runTcpDnsTunnel(tun.fd, host, port, user, password, profile)
@@ -142,19 +163,21 @@ class ProxyVpnService : VpnService() {
 
         if (Store.wholePhone(this)) {
             builder.addDisallowedApplication(packageName)
+            routedPackages = null
         } else {
             val excluded = Store.excluded(this)
-            var allowedCount = 0
+            val allowed = mutableSetOf<String>()
             for (app in Store.routablePackages(this)) {
                 if (app in excluded) continue
                 try {
                     builder.addAllowedApplication(app)
-                    allowedCount++
+                    allowed.add(app)
                 } catch (_: PackageManager.NameNotFoundException) {
                     // The package was removed after the app list was read.
                 }
             }
-            if (allowedCount == 0) throw IOException("Select at least one app before connecting")
+            if (allowed.isEmpty()) throw IOException("Select at least one app before connecting")
+            routedPackages = allowed.toSet()
         }
         return builder
     }
@@ -196,11 +219,14 @@ class ProxyVpnService : VpnService() {
 
     private fun monitor(profile: Profile, isRunning: () -> Boolean) {
         if (stopRequested) return
-        val connected = "Connected to ${profile.host}:${profile.port}"
+        val connected = "VPN connected"
         showForeground(connected)
         setStatus("Connected")
+        val connectivity = getSystemService(ConnectivityManager::class.java)
+        val network = connectivity.activeNetwork
         var nextProbe = SystemClock.elapsedRealtime() + CHECK_INTERVAL_MS
         while (!stopRequested && isRunning()) {
+            if (connectivity.activeNetwork != network) return
             if (SystemClock.elapsedRealtime() >= nextProbe) {
                 val reachable = try {
                     reachableAddress(profile)
@@ -216,24 +242,30 @@ class ProxyVpnService : VpnService() {
     private fun runMappedDnsTunnel(
         fd: Int, host: String, port: Int, user: String, pass: String, udp: Boolean, profile: Profile
     ) {
-        val config = File(filesDir, "tproxy.yaml")
-        try {
-            config.writeText(buildString {
-                append("tunnel:\n  mtu: $MTU\n  ipv4: 198.18.0.1\n  ipv6: 'fc00::1'\n")
-                append("socks5:\n  port: $port\n  address: ${yamlString(host)}\n  udp: '${if (udp) "udp" else "tcp"}'\n")
-                if (user.isNotEmpty()) append("  username: ${yamlString(user)}\n  password: ${yamlString(pass)}\n")
-                append("mapdns:\n  address: $MAPPED_DNS\n  port: 53\n  network: 100.64.0.0\n  netmask: 255.192.0.0\n  cache-size: 10000\n")
-                append("misc:\n  log-level: warn\n")
-            })
-            if (!TProxyService.TProxyStartService(config.absolutePath, fd)) throw IOException("Could not start the proxy tunnel")
+        val config = buildString {
+            append("tunnel:\n  mtu: $MTU\n  ipv4: 198.18.0.1\n  ipv6: 'fc00::1'\n")
+            append("socks5:\n  port: $port\n  address: ${yamlString(host)}\n  udp: '${if (udp) "udp" else "tcp"}'\n")
+            if (user.isNotEmpty()) append("  username: ${yamlString(user)}\n  password: ${yamlString(pass)}\n")
+            append("mapdns:\n  address: $MAPPED_DNS\n  port: 53\n  network: 100.64.0.0\n  netmask: 255.192.0.0\n  cache-size: 10000\n")
+            append("misc:\n  log-level: error\n  log-file: /dev/null\n")
+        }.toByteArray()
+        if (config.size > 4096) throw IOException("Proxy settings are too long")
+        val (input, output) = ParcelFileDescriptor.createPipe()
+        input.use {
+            try {
+                ParcelFileDescriptor.AutoCloseOutputStream(output).use { it.write(config) }
+            } finally {
+                config.fill(0)
+            }
+            if (!TProxyService.TProxyStartService("/proc/self/fd/${input.fd}", fd)) {
+                throw IOException("Could not start the proxy tunnel")
+            }
             try {
                 if (!TProxyService.TProxyIsRunning()) throw IOException("Could not start the proxy tunnel")
                 monitor(profile, TProxyService::TProxyIsRunning)
             } finally {
                 TProxyService.TProxyStopService()
             }
-        } finally {
-            config.delete()
         }
     }
 
@@ -317,6 +349,10 @@ class ProxyVpnService : VpnService() {
             return
         }
         usingDnsOverTcp = false
+        systemAlwaysOn = null
+        systemLockdown = null
+        sessionProfile = null
+        routedPackages = null
         error = failure
         setStatus("Disconnected")
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -336,6 +372,10 @@ class ProxyVpnService : VpnService() {
         stopRequested = true
         if (!wasStopping) worker?.interrupt()
         if (worker != null) {
+            sessionProfile = null
+            routedPackages = null
+            systemAlwaysOn = null
+            systemLockdown = null
             usingDnsOverTcp = false
             setStatus("Disconnected")
         }

@@ -3,6 +3,14 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
+def releaseSigning = [
+    store: System.getenv('SUPPROXY_KEYSTORE'),
+    storePassword: System.getenv('SUPPROXY_STORE_PASSWORD'),
+    alias: System.getenv('SUPPROXY_KEY_ALIAS'),
+    keyPassword: System.getenv('SUPPROXY_KEY_PASSWORD')
+]
+def hasReleaseSigning = releaseSigning.values().every { it }
+
 android {
     namespace 'com.supproxy.app'
     compileSdk 34
@@ -17,8 +25,26 @@ android {
         ndk { abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64' }
     }
 
+    signingConfigs {
+        if (hasReleaseSigning) {
+            production {
+                storeFile file(releaseSigning.store)
+                storePassword releaseSigning.storePassword
+                keyAlias releaseSigning.alias
+                keyPassword releaseSigning.keyPassword
+                enableV2Signing = true
+                enableV3Signing = true
+            }
+        }
+    }
+
     buildTypes {
-        release { minifyEnabled false }
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (hasReleaseSigning) signingConfig signingConfigs.production
+        }
     }
 
     externalNativeBuild {
@@ -30,4 +56,12 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = '17' }
+}
+
+tasks.matching { it.name in ['assembleRelease', 'bundleRelease', 'packageRelease'] }.configureEach {
+    doFirst {
+        if (!hasReleaseSigning) {
+            throw new GradleException('Production signing requires all four SUPPROXY signing variables.')
+        }
+    }
 }
