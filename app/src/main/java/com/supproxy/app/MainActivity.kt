@@ -53,6 +53,8 @@ import android.widget.Toast
 import hev.htproxy.TProxyService
 import org.json.JSONObject
 import java.net.Socket
+import java.net.URI
+import java.net.URISyntaxException
 import java.util.Locale
 
 private val BG = Color.parseColor("#F7F7F4")
@@ -103,7 +105,9 @@ class MainActivity : Activity() {
     private var exitCountryBadge: TextView? = null
     private var exitDuration: TextView? = null
     private var exitGlobe: ExitGlobeView? = null
-    private var showingExitCard = false
+    private var exitStatus: TextView? = null
+    private var exitSignal: View? = null
+    private var exitIndicator: View? = null
     private var resumed = false
     private var homePage: LinearLayout? = null
     private var homeTitle: TextView? = null
@@ -133,7 +137,6 @@ class MainActivity : Activity() {
     private var fUser: EditText? = null
     private var fPass: EditText? = null
     private var authSwitch: Switch? = null
-    private var updateProtocolButtons: (() -> Unit)? = null
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) { refreshHome() }
@@ -394,14 +397,13 @@ class MainActivity : Activity() {
         tab = i
         homeStatusDot = null
         exitCard = null; exitCountryBadge = null; exitAddress = null; exitDuration = null
-        exitGlobe = null; showingExitCard = false
+        exitGlobe = null; exitStatus = null; exitSignal = null; exitIndicator = null
         homePage = null; homeTitle = null; homeSubtitle = null
         exitFacts.clear()
         connectButton = null; statusTv = null; subTv = null
         downloadTv = null; uploadTv = null
         fName = null; fHost = null; fPort = null; fUser = null; fPass = null
         authSwitch = null
-        updateProtocolButtons = null
         ipVals = emptyMap()
         detailsBadge = null
         detailsStatus = null
@@ -443,8 +445,8 @@ class MainActivity : Activity() {
             return
         }
         collectForm()
-        if (!isNumericAddress(profile.host)) {
-            fHost?.error = "Enter a numeric IPv4 address"
+        if (profile.host.isBlank()) {
+            fHost?.error = "Enter a server address"
             fHost?.requestFocus()
             return
         }
@@ -511,13 +513,13 @@ class MainActivity : Activity() {
         val connected = state == "Connected"
         val disconnected = state == "Disconnected"
         val error = ProxyVpnService.error
-        val darkConnected = connected && darkExitCard
         homePage?.setBackgroundColor(when {
-            darkConnected -> 0xFF0B1028.toInt()
+            darkExitCard -> 0xFF0B1028.toInt()
             connected -> 0xFFF7F4FF.toInt()
             else -> HOME_BG
         })
-        homeTitle?.setTextColor(if (darkConnected) Color.WHITE else TEXT)
+        homeTitle?.setTextColor(if (darkExitCard) Color.WHITE else TEXT)
+        homeSubtitle?.setTextColor(if (darkExitCard) 0xFFC0B5E9.toInt() else HOME_MUTED)
         homeSubtitle?.visibility = if (connected) View.GONE else View.VISIBLE
         homeStatusDot?.setColor(when {
             disconnected && error != null -> RED
@@ -575,13 +577,15 @@ class MainActivity : Activity() {
                 val seconds = (SystemClock.elapsedRealtime() - start).coerceAtLeast(0L) / 1000
                 timer.text = String.format(Locale.ROOT, "%02d:%02d:%02d",
                     seconds / 3600, seconds / 60 % 60, seconds % 60)
+            } else {
+                timer.text = ""
             }
         }
         val down = downloadTv ?: return
         val up = uploadTv ?: return
         if (ProxyVpnService.status != "Connected") {
-            down.text = "—"
-            up.text = "—"
+            down.text = ""
+            up.text = ""
             return
         }
         if (ProxyVpnService.usingDnsOverTcp) {
@@ -622,31 +626,52 @@ class MainActivity : Activity() {
             value.text = ipDetails?.get(label)?.takeIf { it.isNotBlank() }
                 ?: if (ipLookupInProgress && label == "IP address") "Checking…" else "--"
         }
-        val card = exitCard ?: return
-        val connected = ProxyVpnService.status == "Connected"
+        val status = exitStatus ?: return
+        val state = ProxyVpnService.status
+        val connected = state == "Connected"
+        val dark = darkExitCard
         exitGlobe?.setForegroundActive(resumed && connected)
-        if (showingExitCard != connected) {
-            showingExitCard = connected
-            card.animate().cancel()
-            if (connected) {
-                card.alpha = 1f
-                card.visibility = View.VISIBLE
-            } else if (resumed && ValueAnimator.areAnimatorsEnabled()) {
-                card.animate().alpha(0f).setDuration(180L).withEndAction {
-                    if (!showingExitCard) card.visibility = View.GONE
-                }.start()
-            } else {
-                card.visibility = View.GONE
+        val statusText = "\u25CF  $state"
+        if (status.text != statusText) {
+            status.text = statusText
+            status.setTextColor(when {
+                connected -> if (dark) 0xFF46F79B.toInt() else 0xFF087D4A.toInt()
+                dark -> 0xFFC0B5E9.toInt()
+                else -> 0xFF5C5085.toInt()
+            })
+            status.background = when {
+                connected && dark -> round(0xFF123A39.toInt(), 18, 0xFF1A584B.toInt())
+                connected -> round(0xFFDEF8E9.toInt(), 18, 0xFFB8E7CD.toInt())
+                dark -> round(0xFF29254C.toInt(), 18, 0xFF483F79.toInt())
+                else -> round(0xFFF0E8FF.toInt(), 18, 0xFFD3C4F3.toInt())
             }
         }
-        fun detail(key: String) = ipDetails?.get(key)?.takeIf { it.isNotBlank() && it != "Unavailable" }
-        exitAddress?.text = detail("IP address") ?: if (ipLookupInProgress) "Checking IP\u2026" else "Unavailable"
+        exitSignal?.visibility = if (connected) View.VISIBLE else View.INVISIBLE
+        exitIndicator?.let { indicator ->
+            if (indicator.isActivated != connected) {
+                indicator.isActivated = connected
+                indicator.animate().cancel()
+                val alpha = if (connected) 1f else 0f
+                if (resumed && ValueAnimator.areAnimatorsEnabled()) {
+                    indicator.animate().alpha(alpha).setDuration(180L).start()
+                } else {
+                    indicator.alpha = alpha
+                }
+            }
+        }
+        fun detail(key: String) = ipDetails?.get(key)?.takeIf { connected && it.isNotBlank() && it != "Unavailable" }
+        exitAddress?.text = when {
+            !connected -> ""
+            else -> detail("IP address") ?: if (ipLookupInProgress) "Checking IP\u2026" else "Unavailable"
+        }
         exitCountryBadge?.apply {
             val code = detail("Country code")
             text = countryFlag(code)?.let { "$it  $code" }.orEmpty()
             visibility = if (text.isEmpty()) View.GONE else View.VISIBLE
         }
-        exitFacts.forEach { (key, view) -> view.text = detail(key) ?: "Unavailable" }
+        exitFacts.forEach { (key, view) ->
+            view.text = if (connected) detail(key) ?: "Unavailable" else ""
+        }
     }
 
     private fun countryFlag(code: String?): String? {
@@ -708,38 +733,47 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    private fun isNumericAddress(host: String): Boolean {
-        val octets = host.split('.')
-        return octets.size == 4 && octets.all { octet ->
-            octet.length in 1..3 && octet.all { it in '0'..'9' } &&
-                octet.toInt() <= 255 && (octet.length == 1 || octet[0] != '0')
-        }
-    }
-
     private fun numericPort(text: String): Int? =
         text.takeIf { it.length in 1..5 && it.all { digit -> digit in '0'..'9' } }
             ?.toInt()?.takeIf { it in 1..65535 }
 
-    private fun pasteEndpoint() {
-        pasteEndpoint(getSystemService(ClipboardManager::class.java).primaryClip)
+    private fun parsePastedHost(text: String): String? {
+        val isUrl = "://" in text
+        val bareIpv6 = !isUrl && text.count { it == ':' } > 1 && !text.startsWith('[')
+        val authority = if (bareIpv6) "[$text]" else text
+        val url = try {
+            URI(if (isUrl) text else "proxy://$authority")
+        } catch (_: URISyntaxException) {
+            return null
+        }
+        val host = url.host?.removeSurrounding("[", "]") ?: return null
+        if (isUrl) {
+            val scheme = url.scheme?.uppercase(Locale.ROOT) ?: return null
+            if (scheme !in listOf("HTTP", "HTTPS", "SOCKS5")) return null
+        } else if (url.rawAuthority != authority || url.rawUserInfo != null || url.port != -1) {
+            return null
+        }
+        return host
     }
 
-    private fun pasteEndpoint(clip: ClipData?) {
+    private fun pasteHost() {
+        pasteHost(getSystemService(ClipboardManager::class.java).primaryClip)
+    }
+
+    private fun pasteHost(clip: ClipData?) {
         val raw = clip?.takeIf { it.itemCount == 1 }?.getItemAt(0)?.text?.toString()
         val empty = clip == null || clip.itemCount == 0 || raw?.isBlank() == true
-        val endpoint = raw?.trim().orEmpty()
-        val host = endpoint.substringBefore(':')
-        val port = numericPort(endpoint.substringAfter(':', ""))
-        if (!isNumericAddress(host) || port == null) {
+        val host = parsePastedHost(raw?.trim().orEmpty())
+        if (host == null) {
             val title = android.text.SpannableString("Paste Failed").apply {
                 setSpan(android.text.style.ForegroundColorSpan(RED), 0, length, 0)
             }
             AlertDialog.Builder(this)
                 .setTitle(title)
                 .setMessage(if (empty) {
-                    "Clipboard is empty. Copy a proxy first, then tap Paste."
+                    "Clipboard is empty. Copy a hostname or proxy URL first."
                 } else {
-                    "Copy a numeric IPv4 address and port, such as 192.0.2.10:8080."
+                    "Copy a hostname, IP address, or proxy URL."
                 })
                 .setPositiveButton("OK", null)
                 .show()
@@ -747,7 +781,6 @@ class MainActivity : Activity() {
         }
 
         fHost?.setText(host)
-        fPort?.setText(port.toString())
     }
 
     // ---------- Home ----------
@@ -826,7 +859,7 @@ class MainActivity : Activity() {
         page.addView(header, lp(MATCH, WRAP))
         exitCard = connectedCard().also { page.addView(it, lp(MATCH, WRAP).apply { topMargin = dp(5) }) }
         val form = vbox(7).apply { background = round(SURFACE, 16, HOME_BORDER) }
-        page.addView(form, lp(MATCH, WRAP).apply { topMargin = dp(5) })
+        page.addView(form, lp(MATCH, WRAP, 1f).apply { topMargin = dp(5) })
 
         fun row() = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
@@ -870,7 +903,7 @@ class MainActivity : Activity() {
             }
         }
         fun addTile(view: View) {
-            form.addView(view, lp(MATCH, WRAP).apply { topMargin = dp(5) })
+            form.addView(view, lp(MATCH, WRAP, 1f).apply { topMargin = dp(5) })
         }
 
         val protocols = listOf("HTTP", "SOCKS5", "HTTPS")
@@ -898,7 +931,7 @@ class MainActivity : Activity() {
                     val selected = protocol == profile.protocol
                     menu.addView(button(protocol, false) {
                         profile.protocol = protocol
-                        updateProtocolButtons?.invoke()
+                        protocolValue.text = protocol
                         dropdown.dismiss()
                     }.apply {
                         background = ripple(Color.TRANSPARENT, 4)
@@ -914,29 +947,22 @@ class MainActivity : Activity() {
                 dropdown.showAsDropDown(anchor, 0, 0, Gravity.START)
             }
         }
-        updateProtocolButtons = { protocolValue.text = profile.protocol }
         val profileName = input("New Profile", profile.name)
         fName = profileName
         form.addView(row().apply {
-            addView(inputTile("Profile", profileName), lp(0, WRAP, 1f).apply { marginEnd = dp(9) })
-            addView(protocolTile, lp(0, WRAP, 1f))
-        }, lp(MATCH, WRAP))
+            addView(inputTile("Profile", profileName), lp(0, MATCH, 1f).apply { marginEnd = dp(9) })
+            addView(protocolTile, lp(0, MATCH, 1f))
+        }, lp(MATCH, WRAP, 1f))
 
         val endpointHint = 0xFF8997AB.toInt()
         val pasteAccent = 0xFF5840CC.toInt()
         val host = input("proxy.example.com", profile.host, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI,
-            ::pasteEndpoint)
-        val port = input("1080", profile.port.takeIf { it > 0 }?.toString().orEmpty(), InputType.TYPE_CLASS_NUMBER,
-            ::pasteEndpoint)
+            ::pasteHost)
+        val port = input("1080", profile.port.takeIf { it > 0 }?.toString().orEmpty(), InputType.TYPE_CLASS_NUMBER)
         for (edit in listOf(host, port)) {
             edit.typeface = Typeface.create("sans-serif", Typeface.NORMAL)
             edit.letterSpacing = 0.015f
             edit.setHintTextColor(endpointHint)
-        }
-        host.filters += InputFilter { source, start, end, dest, dstart, dend ->
-            if ((start until end).any { source[it] !in '0'..'9' && source[it] != '.' }) {
-                dest.subSequence(dstart, dend)
-            } else null
         }
         port.filters += InputFilter { source, start, end, dest, dstart, dend ->
             if (start != end && (dest.length - (dend - dstart) + (end - start) > 5 ||
@@ -978,7 +1004,7 @@ class MainActivity : Activity() {
                 addView(check, lp(dp(18), WRAP).apply { marginStart = dp(4) })
                 addView(View(this@MainActivity).apply { setBackgroundColor(HOME_BORDER) },
                     lp(dp(1), dp(28)).apply { marginStart = dp(5); marginEnd = dp(5) })
-                addView(button("Paste", false, ::pasteEndpoint).apply {
+                addView(button("Paste URL", false, ::pasteHost).apply {
                     background = ripple(0xFFEFEBFA.toInt(), 9)
                     minimumHeight = dp(40)
                     textSize = 13f
@@ -991,14 +1017,14 @@ class MainActivity : Activity() {
                     }
                     setCompoundDrawablesRelative(clipboard, null, null, null)
                     compoundDrawablePadding = dp(4)
-                    contentDescription = "Paste server from clipboard"
+                    contentDescription = "Paste hostname from clipboard or proxy URL"
                 }, lp(WRAP, WRAP))
             }, lp(MATCH, WRAP))
         }
         fun updateEndpointCheck() {
             val portNumber = numericPort(port.str())
             separator.setTextColor(if (host.text.isEmpty() && port.text.isEmpty()) endpointHint else TEXT)
-            check.visibility = if (isNumericAddress(host.str()) && portNumber != null)
+            check.visibility = if (host.str().isNotBlank() && portNumber != null)
                 View.VISIBLE else View.GONE
         }
         val endpointWatcher = object : TextWatcher {
@@ -1008,13 +1034,13 @@ class MainActivity : Activity() {
                 if (s === port.text) fitHost(serverAddress.width)
             }
         }
-        for (edit in listOf(host, port)) {
-            if (Build.VERSION.SDK_INT >= 31) {
-                edit.setOnReceiveContentListener(arrayOf("text/*")) { _, payload ->
-                    pasteEndpoint(payload.clip)
-                    null
-                }
+        if (Build.VERSION.SDK_INT >= 31) {
+            host.setOnReceiveContentListener(arrayOf("text/*")) { _, payload ->
+                pasteHost(payload.clip)
+                null
             }
+        }
+        for (edit in listOf(host, port)) {
             edit.addTextChangedListener(endpointWatcher)
             edit.setOnFocusChangeListener { _, _ ->
                 endpoint.background = round(HOME_BG, 14, if (endpoint.hasFocus()) HOME_BLUE else HOME_BORDER)
@@ -1044,9 +1070,9 @@ class MainActivity : Activity() {
         }
         val authBox = vbox().apply {
             addView(inputTile("Username", username, icon(R.drawable.home_person)),
-                lp(MATCH, WRAP).apply { topMargin = dp(5) })
+                lp(MATCH, WRAP, 1f).apply { topMargin = dp(5) })
             addView(inputTile("Password", password, visibilityButton),
-                lp(MATCH, WRAP).apply { topMargin = dp(5) })
+                lp(MATCH, WRAP, 1f).apply { topMargin = dp(5) })
             visibility = if (profile.auth) View.VISIBLE else View.GONE
         }
         authSwitch = Switch(this).apply {
@@ -1077,7 +1103,7 @@ class MainActivity : Activity() {
             }
         }
         addTile(tile().apply { addView(authSwitch, lp(MATCH, WRAP)) })
-        form.addView(authBox, lp(MATCH, WRAP))
+        form.addView(authBox, lp(MATCH, WRAP, 2f))
 
         connectButton = button("Connect", true) { toggle() }.apply {
             textSize = 18f
@@ -1129,7 +1155,6 @@ class MainActivity : Activity() {
         applyTo(root)
     }
     private fun connectedCard() = vbox(12).apply {
-        visibility = View.GONE
         val dark = darkExitCard
         val foreground = if (dark) 0xFFFAF8FF.toInt() else 0xFF231E48.toInt()
         val lavender = if (dark) 0xFFC0B5E9.toInt() else 0xFF5C5085.toInt()
@@ -1160,14 +1185,15 @@ class MainActivity : Activity() {
         elevation = dp(2).toFloat()
 
         addView(row().apply {
-            addView(tv("\u25CF  Connected", 14f, green, true).apply {
-                background = if (dark) round(0xFF123A39.toInt(), 18, 0xFF1A584B.toInt())
-                    else round(0xFFDEF8E9.toInt(), 18, 0xFFB8E7CD.toInt())
+            exitStatus = tv("", 14f, lavender, true).apply {
                 setPaddingRelative(dp(10), dp(4), dp(10), dp(4))
-            }, lp(WRAP, WRAP))
+                accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+            }
+            addView(exitStatus, lp(WRAP, WRAP))
             addView(View(this@MainActivity), lp(0, 1, 1f))
-            addView(icon(R.drawable.exit_signal).apply { setColorFilter(green) }, lp(dp(19), dp(19)))
-            exitDuration = tv("00:00:00", 14f, lavender).apply { fontFeatureSettings = "tnum" }
+            exitSignal = icon(R.drawable.exit_signal).apply { setColorFilter(green) }
+            addView(exitSignal, lp(dp(19), dp(19)))
+            exitDuration = tv("", 14f, lavender).apply { fontFeatureSettings = "tnum" }
             addView(exitDuration, lp(WRAP, WRAP).apply { marginStart = dp(4) })
         }, lp(MATCH, WRAP))
 
@@ -1222,7 +1248,7 @@ class MainActivity : Activity() {
                         }, lp(dp(20), dp(20)).apply { marginEnd = dp(6) })
                         addView(vbox().apply {
                             addView(tv(label, 11f, lavender))
-                            val value = tv("Unavailable", 13f, foreground, true)
+                            val value = tv("", 13f, foreground, true).apply { minLines = 1 }
                             exitFacts[key] = value
                             addView(value, lp(MATCH, WRAP))
                         }, lp(0, WRAP, 1f))
@@ -1240,13 +1266,15 @@ class MainActivity : Activity() {
             uploadTv = tv("\u2014", 10f, foreground)
             addView(uploadTv, lp(WRAP, WRAP).apply { marginStart = dp(4) })
         }, lp(MATCH, WRAP).apply { topMargin = dp(5) })
-        addView(vbox().apply {
+        exitIndicator = vbox().apply {
+            alpha = 0f
             background = GradientDrawable(
                 GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(0x0046F79B, 0x5146F79B)
             )
             addView(View(this@MainActivity).apply { background = round(0xFF46F79B.toInt(), 2) },
                 lp(MATCH, dp(3)).apply { topMargin = dp(5) })
-        }, lp(MATCH, WRAP).apply { topMargin = dp(2); marginStart = dp(3); marginEnd = dp(3) })
+        }
+        addView(exitIndicator, lp(MATCH, WRAP).apply { topMargin = dp(2); marginStart = dp(3); marginEnd = dp(3) })
     }
 
     private fun updateConnectionDetailsStatus(state: String) {
