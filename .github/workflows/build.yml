@@ -26,7 +26,7 @@ jobs:
         run: |
           # Keep this revision in sync with the native declarations in TProxyService.java.
           git init hev-socks5-tunnel
-          cd hev-socks5-tunnel
+          cd hev-socks5-tunnel || exit 1
           git remote add origin https://github.com/heiher/hev-socks5-tunnel.git
           git fetch --depth 1 origin fc3f90040b8d4b537341c96538669a9b2e35d514
           git checkout --detach FETCH_HEAD
@@ -76,7 +76,8 @@ jobs:
           SIGNING_CERT_SHA256: ${{ secrets.SUPPROXY_SIGNING_CERT_SHA256 }}
         run: |
           umask 077
-          export SUPPROXY_KEYSTORE="$(mktemp "$RUNNER_TEMP/supproxy-signing.XXXXXXXX")"
+          SUPPROXY_KEYSTORE="$(mktemp "$RUNNER_TEMP/supproxy-signing.XXXXXXXX")"
+          export SUPPROXY_KEYSTORE
           trap 'rm -f -- "$SUPPROXY_KEYSTORE"' EXIT
           test -n "$KEYSTORE_BASE64"
           test -n "$SIGNING_CERT_SHA256"

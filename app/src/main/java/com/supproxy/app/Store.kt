@@ -17,7 +17,7 @@ data class Profile(
     var name: String = "New Profile",
     var protocol: String = "SOCKS5",
     var host: String = "",
-    var port: Int = 1080,
+    var port: Int = 0,
     var auth: Boolean = false,
     var user: String = "",
     var pass: String = ""
@@ -28,7 +28,7 @@ data class Profile(
     companion object {
         fun fromJson(o: JSONObject) = Profile(
             o.optString("name", "Profile"), o.optString("protocol", "SOCKS5"), o.optString("host"),
-            o.optInt("port", 1080), o.optBoolean("auth"), o.optString("user"), o.optString("pass")
+            o.optInt("port", 0), o.optBoolean("auth"), o.optString("user"), o.optString("pass")
         )
     }
 }
@@ -41,7 +41,12 @@ object Store {
         private set
 
     fun active(c: Context): Profile =
-        readProtected(c, "active")?.let { Profile.fromJson(JSONObject(it)) } ?: Profile()
+        readProtected(c, "active")?.let {
+            Profile.fromJson(JSONObject(it)).apply {
+                // Clear the old default from unfinished profiles.
+                if (host.isBlank() && port == 1080) port = 0
+            }
+        } ?: Profile()
 
     fun setActive(c: Context, pr: Profile): Boolean = writeProtected(c, "active", pr.toJson().toString())
 

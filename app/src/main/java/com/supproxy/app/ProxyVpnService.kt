@@ -38,6 +38,8 @@ class ProxyVpnService : VpnService() {
         private const val MAX_RETRY_MS = 60_000L
 
         @Volatile var status = "Disconnected"
+        @Volatile var connectedSinceMillis = 0L
+            private set
         @Volatile var error: String? = null
         @Volatile var usingDnsOverTcp = false
         @Volatile var systemAlwaysOn: Boolean? = null
@@ -305,6 +307,9 @@ class ProxyVpnService : VpnService() {
     private fun encode(value: String) = URLEncoder.encode(value, "UTF-8").replace("+", "%20")
 
     private fun setStatus(value: String) {
+        if (status != value) {
+            connectedSinceMillis = if (value == "Connected") SystemClock.elapsedRealtime() else 0L
+        }
         status = value
         sendBroadcast(Intent(ACTION_STATE).setPackage(packageName))
     }
