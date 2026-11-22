@@ -1,10 +1,12 @@
 package com.supproxy.app
 
 import android.Manifest
+import android.animation.ValueAnimator
 import android.app.Activity
 import android.app.KeyguardManager
 import android.app.AlertDialog
 import android.content.BroadcastReceiver
+import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
@@ -15,6 +17,7 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -28,6 +31,7 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
 import android.text.Editable
+import android.text.InputFilter
 import android.text.InputType
 import android.text.TextWatcher
 import android.view.Gravity
@@ -41,6 +45,7 @@ import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.PopupWindow
 import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
@@ -97,6 +102,9 @@ class MainActivity : Activity() {
     private var exitCard: View? = null
     private var exitCountryBadge: TextView? = null
     private var exitDuration: TextView? = null
+    private var exitGlobe: ExitGlobeView? = null
+    private var showingExitCard = false
+    private var resumed = false
     private var homePage: LinearLayout? = null
     private var homeTitle: TextView? = null
     private var homeSubtitle: TextView? = null
@@ -115,6 +123,10 @@ class MainActivity : Activity() {
     private var ipDetails: Map<String, String>? = null
     private var ipLookupInProgress = false
     private var ipLookupGeneration = 0
+    private var ipLookupSession = 0L
+    private var nextIpLookupAt = 0L
+    private val darkExitCard: Boolean
+        get() = resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES
     private var fName: EditText? = null
     private var fHost: EditText? = null
     private var fPort: EditText? = null
@@ -130,6 +142,7 @@ class MainActivity : Activity() {
     private val tick = object : Runnable {
         override fun run() {
             updateStats()
+            refreshExitLookup()
             ui.postDelayed(this, 1000)
         }
     }
@@ -174,7 +187,16 @@ class MainActivity : Activity() {
         addView(inner)
     }
 
-    private fun field(hint: String, value: String, type: Int = InputType.TYPE_CLASS_TEXT) = EditText(this).apply {
+    private fun field(hint: String, value: String, type: Int = InputType.TYPE_CLASS_TEXT,
+                      paste: (() -> Unit)? = null) = object : EditText(this) {
+        override fun onTextContextMenuItem(id: Int): Boolean {
+            if (paste != null && (id == android.R.id.paste || id == android.R.id.pasteAsPlainText)) {
+                paste()
+                return true
+            }
+            return super.onTextContextMenuItem(id)
+        }
+    }.apply {
         setHint(hint)
         setText(value)
         setTextColor(TEXT)
@@ -266,6 +288,7 @@ class MainActivity : Activity() {
         navItems = listOf("Home", "Profiles", "Apps", "Settings").mapIndexed { index, label ->
             button(label, false) { if (tab != index) show(index) }.apply {
                 textSize = 13f
+                letterSpacing = 0.02f
                 setPadding(dp(3), dp(7), dp(3), dp(7))
                 setCompoundDrawablesWithIntrinsicBounds(0, navIcons[index], 0, 0)
                 compoundDrawablePadding = dp(3)
@@ -301,6 +324,7 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        resumed = true
         val f = IntentFilter(ProxyVpnService.ACTION_STATE)
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, f, Context.RECEIVER_NOT_EXPORTED)
         else registerReceiver(receiver, f)
@@ -313,6 +337,8 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         super.onPause()
+        resumed = false
+        exitGlobe?.setForegroundActive(false)
         collectForm()
         Store.setActive(this, profile)
         unregisterReceiver(receiver)
@@ -368,6 +394,7 @@ class MainActivity : Activity() {
         tab = i
         homeStatusDot = null
         exitCard = null; exitCountryBadge = null; exitAddress = null; exitDuration = null
+        exitGlobe = null; showingExitCard = false
         homePage = null; homeTitle = null; homeSubtitle = null
         exitFacts.clear()
         connectButton = null; statusTv = null; subTv = null
@@ -405,7 +432,7 @@ class MainActivity : Activity() {
         if (fHost == null) return
         profile.name = fName.str().ifEmpty { "New Profile" }
         profile.host = fHost.str()
-        profile.port = fPort.str().toIntOrNull() ?: 0
+        profile.port = numericPort(fPort.str()) ?: 0
         profile.user = fUser.str()
         profile.pass = fPass?.text?.toString().orEmpty()
     }
@@ -416,8 +443,8 @@ class MainActivity : Activity() {
             return
         }
         collectForm()
-        if (profile.host.isBlank()) {
-            fHost?.error = "Enter a server address"
+        if (!isNumericAddress(profile.host)) {
+            fHost?.error = "Enter a numeric IPv4 address"
             fHost?.requestFocus()
             return
         }
@@ -484,8 +511,13 @@ class MainActivity : Activity() {
         val connected = state == "Connected"
         val disconnected = state == "Disconnected"
         val error = ProxyVpnService.error
-        homePage?.setBackgroundColor(if (connected) 0xFF101229.toInt() else HOME_BG)
-        homeTitle?.setTextColor(if (connected) Color.WHITE else TEXT)
+        val darkConnected = connected && darkExitCard
+        homePage?.setBackgroundColor(when {
+            darkConnected -> 0xFF0B1028.toInt()
+            connected -> 0xFFF7F4FF.toInt()
+            else -> HOME_BG
+        })
+        homeTitle?.setTextColor(if (darkConnected) Color.WHITE else TEXT)
         homeSubtitle?.visibility = if (connected) View.GONE else View.VISIBLE
         homeStatusDot?.setColor(when {
             disconnected && error != null -> RED
@@ -530,14 +562,7 @@ class MainActivity : Activity() {
                 else -> "${profile.host}:${profile.port} \u00B7 ${profile.protocol}"
             }
         }
-        if (!connected) {
-            ipDetails = null
-            ipLookupInProgress = false
-            ipLookupGeneration++
-        } else if (!locked && (exitCard != null || ipVals.isNotEmpty() || diagnosticsView != null)
-            && ipDetails == null && !ipLookupInProgress) {
-            lookupIp()
-        }
+        refreshExitLookup()
         renderIp()
         updateDiagnostics()
         updateStats()
@@ -574,6 +599,24 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun refreshExitLookup() {
+        val session = if (ProxyVpnService.status == "Connected") ProxyVpnService.connectedSinceMillis else 0L
+        if (session != ipLookupSession) {
+            ipLookupSession = session
+            ipDetails = null
+            ipLookupInProgress = false
+            ipLookupGeneration++
+            nextIpLookupAt = 0L
+            renderIp()
+            updateDiagnostics()
+        }
+        if (session != 0L && resumed && !locked && !ipLookupInProgress
+            && SystemClock.elapsedRealtime() >= nextIpLookupAt
+            && (exitCard != null || ipVals.isNotEmpty() || diagnosticsView != null)) {
+            lookupIp()
+        }
+    }
+
     private fun renderIp() {
         ipVals.forEach { (label, value) ->
             value.text = ipDetails?.get(label)?.takeIf { it.isNotBlank() }
@@ -581,16 +624,29 @@ class MainActivity : Activity() {
         }
         val card = exitCard ?: return
         val connected = ProxyVpnService.status == "Connected"
-        card.visibility = if (connected) View.VISIBLE else View.GONE
-        if (!connected) return
+        exitGlobe?.setForegroundActive(resumed && connected)
+        if (showingExitCard != connected) {
+            showingExitCard = connected
+            card.animate().cancel()
+            if (connected) {
+                card.alpha = 1f
+                card.visibility = View.VISIBLE
+            } else if (resumed && ValueAnimator.areAnimatorsEnabled()) {
+                card.animate().alpha(0f).setDuration(180L).withEndAction {
+                    if (!showingExitCard) card.visibility = View.GONE
+                }.start()
+            } else {
+                card.visibility = View.GONE
+            }
+        }
         fun detail(key: String) = ipDetails?.get(key)?.takeIf { it.isNotBlank() && it != "Unavailable" }
-        exitAddress?.text = detail("IP address") ?: if (ipLookupInProgress) "Checking IP\u2026" else "IP unavailable"
+        exitAddress?.text = detail("IP address") ?: if (ipLookupInProgress) "Checking IP\u2026" else "Unavailable"
         exitCountryBadge?.apply {
             val code = detail("Country code")
             text = countryFlag(code)?.let { "$it  $code" }.orEmpty()
             visibility = if (text.isEmpty()) View.GONE else View.VISIBLE
         }
-        exitFacts.forEach { (key, view) -> view.text = detail(key) ?: "\u2014" }
+        exitFacts.forEach { (key, view) -> view.text = detail(key) ?: "Unavailable" }
     }
 
     private fun countryFlag(code: String?): String? {
@@ -602,13 +658,14 @@ class MainActivity : Activity() {
 
     private fun lookupIp() {
         val pr = ProxyVpnService.sessionProfile ?: return
+        val session = ProxyVpnService.connectedSinceMillis
         val generation = ++ipLookupGeneration
         ipLookupInProgress = true
         renderIp()
         Thread {
             var res: Map<String, String>? = null
             try {
-                val host = "ipwho.is"
+                val host = Upstream.EXIT_LOOKUP_HOST
                 val response = Upstream.open(pr, host, 443).use { raw ->
                     Upstream.verifiedTls(raw, host, 443).use { ssl ->
                         ssl.outputStream.write("GET / HTTP/1.0\r\nHost: $host\r\nConnection: close\r\n\r\n".toByteArray())
@@ -634,51 +691,63 @@ class MainActivity : Activity() {
                     "Region" to j.optString("region"),
                     "City" to j.optString("city"),
                     "Country code" to j.optString("country_code"),
-                    "ASN" to (j.optJSONObject("connection")?.optInt("asn")?.takeIf { it > 0 }?.let { "AS$it" } ?: ""),
+                    "ASN" to (j.optJSONObject("connection")?.optLong("asn")?.takeIf { it > 0 }?.let { "AS$it" } ?: ""),
                     "ISP" to (j.optJSONObject("connection")?.optString("isp") ?: ""),
                     "ZIP" to j.optString("postal")
                 )
             } catch (_: Throwable) {}
             runOnUiThread {
-                if (generation != ipLookupGeneration || ProxyVpnService.status != "Connected") return@runOnUiThread
+                if (generation != ipLookupGeneration || ProxyVpnService.status != "Connected" ||
+                    session != ProxyVpnService.connectedSinceMillis) return@runOnUiThread
                 ipLookupInProgress = false
                 ipDetails = res ?: mapOf("IP address" to "Unavailable")
+                nextIpLookupAt = SystemClock.elapsedRealtime() + 60_000L
                 renderIp()
                 updateDiagnostics()
             }
         }.start()
     }
 
-    private fun applyPasted(raw: String) {
-        val pasted = raw.trim()
-        val scheme = pasted.substringBefore("://", "").uppercase()
-        val hasProtocol = scheme in listOf("SOCKS5", "HTTP", "HTTPS")
-        if (hasProtocol) {
-            profile.protocol = scheme
-            updateProtocolButtons?.invoke()
+    private fun isNumericAddress(host: String): Boolean {
+        val octets = host.split('.')
+        return octets.size == 4 && octets.all { octet ->
+            octet.length in 1..3 && octet.all { it in '0'..'9' } &&
+                octet.toInt() <= 255 && (octet.length == 1 || octet[0] != '0')
         }
-        var s = if (hasProtocol) pasted.substringAfter("://") else pasted
-        var user = ""
-        var pass = ""
-        var hp = s
-        if ("@" in s) {
-            val cred = s.substringBeforeLast("@")
-            hp = s.substringAfterLast("@")
-            user = cred.substringBefore(":")
-            pass = cred.substringAfter(":", "")
-        } else if (s.count { it == ':' } == 3) {
-            val p = s.split(":")
-            hp = p[0] + ":" + p[1]; user = p[2]; pass = p[3]
+    }
+
+    private fun numericPort(text: String): Int? =
+        text.takeIf { it.length in 1..5 && it.all { digit -> digit in '0'..'9' } }
+            ?.toInt()?.takeIf { it in 1..65535 }
+
+    private fun pasteEndpoint() {
+        pasteEndpoint(getSystemService(ClipboardManager::class.java).primaryClip)
+    }
+
+    private fun pasteEndpoint(clip: ClipData?) {
+        val raw = clip?.takeIf { it.itemCount == 1 }?.getItemAt(0)?.text?.toString()
+        val empty = clip == null || clip.itemCount == 0 || raw?.isBlank() == true
+        val endpoint = raw?.trim().orEmpty()
+        val host = endpoint.substringBefore(':')
+        val port = numericPort(endpoint.substringAfter(':', ""))
+        if (!isNumericAddress(host) || port == null) {
+            val title = android.text.SpannableString("Paste Failed").apply {
+                setSpan(android.text.style.ForegroundColorSpan(RED), 0, length, 0)
+            }
+            AlertDialog.Builder(this)
+                .setTitle(title)
+                .setMessage(if (empty) {
+                    "Clipboard is empty. Copy a proxy first, then tap Paste."
+                } else {
+                    "Copy a numeric IPv4 address and port, such as 192.0.2.10:8080."
+                })
+                .setPositiveButton("OK", null)
+                .show()
+            return
         }
-        s = hp
-        fHost?.setText(s.substringBeforeLast(":"))
-        if (":" in s) fPort?.setText(s.substringAfterLast(":"))
-        if (user.isNotEmpty()) {
-            profile.auth = true
-            fUser?.setText(user)
-            fPass?.setText(pass)
-            authSwitch?.isChecked = true
-        }
+
+        fHost?.setText(host)
+        fPort?.setText(port.toString())
     }
 
     // ---------- Home ----------
@@ -695,7 +764,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
         }
         val branding = LinearLayout(this).apply {
-            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
             addView(ImageView(this@MainActivity).apply {
                 setImageResource(R.drawable.logo)
                 background = round(Color.parseColor("#1E2235"), 16)
@@ -717,13 +786,19 @@ class MainActivity : Activity() {
                 addView(homeSubtitle)
             }, lp(WRAP, WRAP).apply { marginStart = dp(8) })
         }
+        header.addView(branding, lp(0, WRAP, 1f))
+
         fun headerAction(icon: Int, label: String, filled: Boolean, action: () -> Unit) =
             ImageButton(this).apply {
                 contentDescription = label
                 setImageResource(icon)
                 setColorFilter(if (filled) Color.WHITE else HOME_MUTED)
-                scaleType = ImageView.ScaleType.CENTER
-                background = ripple(if (filled) HOME_BLUE else SURFACE, 14, if (filled) 0 else HOME_BORDER)
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                background = android.graphics.drawable.InsetDrawable(
+                    ripple(if (filled) HOME_BLUE else SURFACE, 7, if (filled) 0 else HOME_BORDER),
+                    dp(11), dp(13), dp(11), dp(13)
+                )
+                setPadding(dp(19), dp(19), dp(19), dp(19))
                 setOnClickListener { action() }
             }
 
@@ -734,7 +809,7 @@ class MainActivity : Activity() {
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton("Clear") { _, _ -> clearCurrentProxy() }
                 .show()
-        }, lp(dp(52), dp(44)).apply { marginEnd = dp(5) })
+        }, lp(dp(48), dp(48)))
         header.addView(headerAction(R.drawable.home_save, "Save profile", true) {
             collectForm()
             if (profile.host.isBlank()) { toast("Enter a server first"); return@headerAction }
@@ -746,8 +821,7 @@ class MainActivity : Activity() {
                 return@headerAction
             }
             toast("Saved \"${profile.name}\"")
-        }, lp(dp(52), dp(44)))
-        header.addView(branding, lp(0, WRAP, 1f).apply { marginStart = dp(8) })
+        }, lp(dp(48), dp(48)))
 
         page.addView(header, lp(MATCH, WRAP))
         exitCard = connectedCard().also { page.addView(it, lp(MATCH, WRAP).apply { topMargin = dp(5) }) }
@@ -767,11 +841,12 @@ class MainActivity : Activity() {
         fun caption(title: String) = tv(title, 12f, HOME_MUTED, true).apply {
             letterSpacing = 0.035f
         }
-        fun input(hint: String, value: String, type: Int = InputType.TYPE_CLASS_TEXT) =
-            field(hint, value, type).apply {
+        fun input(hint: String, value: String, type: Int = InputType.TYPE_CLASS_TEXT,
+                  paste: (() -> Unit)? = null) =
+            field(hint, value, type, paste).apply {
                 id = View.generateViewId()
                 textSize = 15f
-                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                typeface = Typeface.create("sans-serif", Typeface.NORMAL)
                 setHintTextColor(HOME_MUTED)
                 background = null
                 minHeight = 0
@@ -798,7 +873,7 @@ class MainActivity : Activity() {
             form.addView(view, lp(MATCH, WRAP).apply { topMargin = dp(5) })
         }
 
-        val protocols = arrayOf("SOCKS5", "HTTP", "HTTPS")
+        val protocols = listOf("HTTP", "SOCKS5", "HTTPS")
         val protocolValue = tv(profile.protocol, 17f, TEXT, true)
         val protocolTile = tile().apply {
             addView(row().apply {
@@ -810,16 +885,33 @@ class MainActivity : Activity() {
             }, lp(MATCH, WRAP))
             foreground = ripple(Color.TRANSPARENT, 18)
             isFocusable = true
-            setOnClickListener {
-                AlertDialog.Builder(this@MainActivity)
-                    .setTitle("Proxy protocol")
-                    .setSingleChoiceItems(protocols, protocols.indexOf(profile.protocol)) { dialog, selected ->
-                        profile.protocol = protocols[selected]
+            setOnClickListener { anchor ->
+                val menu = vbox().apply { setPadding(0, dp(5), 0, dp(5)) }
+                val dropdown = PopupWindow(menu, maxOf(dp(104), anchor.width * 3 / 4), WRAP, true).apply {
+                    animationStyle = R.style.ProtocolDropdownAnimation
+                    setBackgroundDrawable(round(0xFFF1ECF8.toInt(), 8))
+                    elevation = dp(5).toFloat()
+                    isOutsideTouchable = true
+                    inputMethodMode = PopupWindow.INPUT_METHOD_NOT_NEEDED
+                }
+                for (protocol in protocols) {
+                    val selected = protocol == profile.protocol
+                    menu.addView(button(protocol, false) {
+                        profile.protocol = protocol
                         updateProtocolButtons?.invoke()
-                        dialog.dismiss()
-                    }
-                    .setNegativeButton("Cancel", null)
-                    .show()
+                        dropdown.dismiss()
+                    }.apply {
+                        background = ripple(Color.TRANSPARENT, 4)
+                        gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                        setPaddingRelative(dp(13), 0, dp(8), 0)
+                        setTextColor(TEXT)
+                        textSize = 16f
+                        letterSpacing = 0.02f
+                        typeface = Typeface.create("sans-serif", if (selected) Typeface.BOLD else Typeface.NORMAL)
+                        isSelected = selected
+                    }, lp(MATCH, WRAP))
+                }
+                dropdown.showAsDropDown(anchor, 0, 0, Gravity.START)
             }
         }
         updateProtocolButtons = { protocolValue.text = profile.protocol }
@@ -830,15 +922,36 @@ class MainActivity : Activity() {
             addView(protocolTile, lp(0, WRAP, 1f))
         }, lp(MATCH, WRAP))
 
-        val host = input("Server address", profile.host, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
-        val port = input("Port", profile.port.takeIf { it > 0 }?.toString().orEmpty(), InputType.TYPE_CLASS_NUMBER)
+        val endpointHint = 0xFF8997AB.toInt()
+        val pasteAccent = 0xFF5840CC.toInt()
+        val host = input("proxy.example.com", profile.host, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI,
+            ::pasteEndpoint)
+        val port = input("1080", profile.port.takeIf { it > 0 }?.toString().orEmpty(), InputType.TYPE_CLASS_NUMBER,
+            ::pasteEndpoint)
+        for (edit in listOf(host, port)) {
+            edit.typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+            edit.letterSpacing = 0.015f
+            edit.setHintTextColor(endpointHint)
+        }
+        host.filters += InputFilter { source, start, end, dest, dstart, dend ->
+            if ((start until end).any { source[it] !in '0'..'9' && source[it] != '.' }) {
+                dest.subSequence(dstart, dend)
+            } else null
+        }
+        port.filters += InputFilter { source, start, end, dest, dstart, dend ->
+            if (start != end && (dest.length - (dend - dstart) + (end - start) > 5 ||
+                    (start until end).any { source[it] !in '0'..'9' })) {
+                dest.subSequence(dstart, dend)
+            } else null
+        }
         fHost = host
         fPort = port
         val check = tv("\u2713", 21f, HOME_GREEN, true).apply {
             gravity = Gravity.CENTER
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
-        val separator = tv(":", 17f, TEXT, true).apply {
+        val separator = tv(":", 15f, endpointHint).apply {
+            setPaddingRelative(dp(3), 0, dp(3), 0)
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
         val serverAddress = row().apply {
@@ -849,7 +962,8 @@ class MainActivity : Activity() {
         fun fitHost(availableWidth: Int) {
             if (availableWidth <= 0) return
             val portText = port.text.ifEmpty { port.hint }
-            val reservedWidth = port.paint.measureText(portText.toString()) + separator.paint.measureText(":")
+            val reservedWidth = port.paint.measureText(portText.toString()) + separator.paint.measureText(":") +
+                separator.paddingStart + separator.paddingEnd
             host.maxWidth = (availableWidth - kotlin.math.ceil(reservedWidth).toInt()).coerceAtLeast(1)
         }
         serverAddress.addOnLayoutChangeListener { _, left, _, right, _, oldLeft, _, oldRight, _ ->
@@ -863,27 +977,29 @@ class MainActivity : Activity() {
                 }, lp(0, WRAP, 1f))
                 addView(check, lp(dp(18), WRAP).apply { marginStart = dp(4) })
                 addView(View(this@MainActivity).apply { setBackgroundColor(HOME_BORDER) },
-                    lp(dp(1), dp(30)).apply { marginStart = dp(7); marginEnd = dp(7) })
-                addView(button("Paste", false) {
-                    val cm = getSystemService(ClipboardManager::class.java)
-                    val text = cm.primaryClip?.getItemAt(0)?.text?.toString()
-                    if (text.isNullOrBlank()) toast("Clipboard is empty") else applyPasted(text)
-                }.apply {
-                    background = ripple(Color.TRANSPARENT, 12)
+                    lp(dp(1), dp(28)).apply { marginStart = dp(5); marginEnd = dp(5) })
+                addView(button("Paste", false, ::pasteEndpoint).apply {
+                    background = ripple(0xFFEFEBFA.toInt(), 9)
                     minimumHeight = dp(40)
-                    setTextColor(HOME_BLUE)
-                    setPaddingRelative(dp(3), 0, 0, 0)
-                    setCompoundDrawablesRelativeWithIntrinsicBounds(R.drawable.home_clipboard, 0, 0, 0)
-                    compoundDrawableTintList = ColorStateList.valueOf(HOME_BLUE)
-                    compoundDrawablePadding = dp(5)
+                    textSize = 13f
+                    typeface = Typeface.create("sans-serif", Typeface.BOLD)
+                    setTextColor(pasteAccent)
+                    setPaddingRelative(dp(6), 0, dp(6), 0)
+                    val clipboard = context.getDrawable(R.drawable.home_clipboard)?.mutate()?.apply {
+                        setBounds(0, 0, dp(17), dp(17))
+                        setTint(pasteAccent)
+                    }
+                    setCompoundDrawablesRelative(clipboard, null, null, null)
+                    compoundDrawablePadding = dp(4)
                     contentDescription = "Paste server from clipboard"
                 }, lp(WRAP, WRAP))
             }, lp(MATCH, WRAP))
         }
         fun updateEndpointCheck() {
-            val portNumber = port.str().toIntOrNull()
-            check.visibility = if (host.str().isNotBlank() && portNumber != null && portNumber in 1..65535)
-                View.VISIBLE else View.INVISIBLE
+            val portNumber = numericPort(port.str())
+            separator.setTextColor(if (host.text.isEmpty() && port.text.isEmpty()) endpointHint else TEXT)
+            check.visibility = if (isNumericAddress(host.str()) && portNumber != null)
+                View.VISIBLE else View.GONE
         }
         val endpointWatcher = object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
@@ -893,6 +1009,12 @@ class MainActivity : Activity() {
             }
         }
         for (edit in listOf(host, port)) {
+            if (Build.VERSION.SDK_INT >= 31) {
+                edit.setOnReceiveContentListener(arrayOf("text/*")) { _, payload ->
+                    pasteEndpoint(payload.clip)
+                    null
+                }
+            }
             edit.addTextChangedListener(endpointWatcher)
             edit.setOnFocusChangeListener { _, _ ->
                 endpoint.background = round(HOME_BG, 14, if (endpoint.hasFocus()) HOME_BLUE else HOME_BORDER)
@@ -985,13 +1107,38 @@ class MainActivity : Activity() {
         status.addView(subTv, lp(WRAP, WRAP).apply { marginStart = dp(8) })
         page.addView(status, lp(MATCH, WRAP).apply { topMargin = dp(5) })
 
+        applyHomeTypography(page)
         refreshHome()
         return scroll(page)
     }
-    private fun connectedCard() = vbox(10).apply {
-        val lavender = 0xFFC0B5E9.toInt()
-        val green = 0xFF46F79B.toInt()
-        val border = 0xFF483F79.toInt()
+
+    private fun applyHomeTypography(root: View) {
+        val family = Typeface.create("sans-serif", Typeface.NORMAL)
+        fun applyTo(view: View) {
+            if (view is TextView) {
+                val current = view.typeface ?: Typeface.DEFAULT
+                if (Build.VERSION.SDK_INT >= 28) {
+                    view.typeface = Typeface.create(family, current.weight, current.isItalic)
+                }
+                if (view.letterSpacing == 0f) view.letterSpacing = 0.02f
+            }
+            if (view is ViewGroup) {
+                for (index in 0 until view.childCount) applyTo(view.getChildAt(index))
+            }
+        }
+        applyTo(root)
+    }
+    private fun connectedCard() = vbox(12).apply {
+        visibility = View.GONE
+        val dark = darkExitCard
+        val foreground = if (dark) 0xFFFAF8FF.toInt() else 0xFF231E48.toInt()
+        val lavender = if (dark) 0xFFC0B5E9.toInt() else 0xFF5C5085.toInt()
+        val green = if (dark) 0xFF46F79B.toInt() else 0xFF087D4A.toInt()
+        val border = if (dark) 0xFF483F79.toInt() else 0xFFD3C4F3.toInt()
+        val badgeFill = if (dark) 0xFF29254C.toInt() else 0xFFF0E8FF.toInt()
+        val tileColors = if (dark) intArrayOf(0xFF2A274D.toInt(), 0xFF181C37.toInt())
+            else intArrayOf(0xFFF9F5FF.toInt(), 0xFFEFE8FC.toInt())
+        val inlineBadge = resources.configuration.screenWidthDp >= 360 && resources.configuration.fontScale < 1.3f
         fun panel(colors: IntArray, radius: Int, stroke: Int) =
             GradientDrawable(GradientDrawable.Orientation.TL_BR, colors).apply {
                 cornerRadius = dp(radius).toFloat()
@@ -1006,42 +1153,55 @@ class MainActivity : Activity() {
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
         background = panel(
-            intArrayOf(0xFF212652.toInt(), 0xFF121831.toInt(), 0xFF191635.toInt()), 19, 0xFF7563BB.toInt()
+            if (dark) intArrayOf(0xFF222951.toInt(), 0xFF111730.toInt(), 0xFF181433.toInt())
+            else intArrayOf(0xFFFEFCFF.toInt(), 0xFFF3ECFF.toInt(), 0xFFE8E2FC.toInt()),
+            28, if (dark) 0xFF8C77DB.toInt() else 0xFFC6B5F2.toInt()
         )
+        elevation = dp(2).toFloat()
 
         addView(row().apply {
             addView(tv("\u25CF  Connected", 14f, green, true).apply {
-                background = round(0xFF123A39.toInt(), 18, 0xFF1A584B.toInt())
+                background = if (dark) round(0xFF123A39.toInt(), 18, 0xFF1A584B.toInt())
+                    else round(0xFFDEF8E9.toInt(), 18, 0xFFB8E7CD.toInt())
                 setPaddingRelative(dp(10), dp(4), dp(10), dp(4))
             }, lp(WRAP, WRAP))
             addView(View(this@MainActivity), lp(0, 1, 1f))
-            addView(icon(R.drawable.exit_signal), lp(dp(19), dp(19)))
+            addView(icon(R.drawable.exit_signal).apply { setColorFilter(green) }, lp(dp(19), dp(19)))
             exitDuration = tv("00:00:00", 14f, lavender).apply { fontFeatureSettings = "tnum" }
             addView(exitDuration, lp(WRAP, WRAP).apply { marginStart = dp(4) })
         }, lp(MATCH, WRAP))
 
+        val countryBadge = tv("", 12f, foreground, true).apply {
+            background = round(badgeFill, 14, border)
+            setPaddingRelative(dp(7), dp(4), dp(7), dp(4))
+            visibility = View.GONE
+        }
+        exitCountryBadge = countryBadge
         addView(row().apply {
-            addView(icon(R.drawable.exit_location_pin), lp(dp(72), dp(66)))
+            val globe = ExitGlobeView(this@MainActivity)
+            exitGlobe = globe
+            addView(globe, lp(dp(76), dp(70)))
             addView(View(this@MainActivity).apply { setBackgroundColor(border) },
                 lp(dp(1), dp(49)).apply { marginEnd = dp(8) })
             addView(vbox().apply {
-                exitAddress = tv("", 24f, Color.WHITE).apply {
+                exitAddress = tv("", 24f, foreground).apply {
                     typeface = Typeface.create("sans-serif", Typeface.BOLD)
                     includeFontPadding = false
-                    setAutoSizeTextTypeUniformWithConfiguration(10, 24, 1, android.util.TypedValue.COMPLEX_UNIT_SP)
-                    maxLines = 2
+                    gravity = Gravity.CENTER_VERTICAL
+                    if (inlineBadge) {
+                        setAutoSizeTextTypeUniformWithConfiguration(10, 24, 1, android.util.TypedValue.COMPLEX_UNIT_SP)
+                        maxLines = 2
+                    } else {
+                        textSize = 19f
+                    }
                     accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
                 }
-                addView(exitAddress, lp(MATCH, dp(32)))
-                addView(tv("Your current IP address", 11f, lavender), lp(MATCH, WRAP))
+                addView(exitAddress, lp(MATCH, if (inlineBadge) dp(39) else WRAP))
+                addView(tv("Your current IP Address", 12f, lavender), lp(MATCH, WRAP))
+                if (!inlineBadge) addView(countryBadge, lp(WRAP, WRAP).apply { topMargin = dp(4) })
             }, lp(0, WRAP, 1f))
-            exitCountryBadge = tv("", 12f, Color.WHITE, true).apply {
-                background = round(0xFF29254C.toInt(), 13, border)
-                setPaddingRelative(dp(6), dp(4), dp(6), dp(4))
-                visibility = View.GONE
-            }
-            addView(exitCountryBadge, lp(WRAP, WRAP).apply { marginStart = dp(4) })
-        }, lp(MATCH, WRAP).apply { topMargin = dp(4) })
+            if (inlineBadge) addView(countryBadge, lp(WRAP, WRAP).apply { marginStart = dp(4) })
+        }, lp(MATCH, WRAP).apply { topMargin = dp(7); bottomMargin = dp(3) })
 
         val facts = listOf(
             Triple("City", "City", R.drawable.exit_city),
@@ -1054,13 +1214,15 @@ class MainActivity : Activity() {
                 for ((index, fact) in pair.withIndex()) {
                     val (label, key, drawable) = fact
                     addView(row().apply {
-                        minimumHeight = dp(45)
-                        background = panel(intArrayOf(0xFF292549.toInt(), 0xFF181C37.toInt()), 11, border)
-                        setPaddingRelative(dp(8), dp(4), dp(5), dp(4))
-                        addView(icon(drawable), lp(dp(20), dp(20)).apply { marginEnd = dp(6) })
+                        minimumHeight = dp(51)
+                        background = panel(tileColors, 17, border)
+                        setPaddingRelative(dp(8), dp(6), dp(6), dp(6))
+                        addView(icon(drawable).apply {
+                            if (!dark) setColorFilter(0xFF7045C2.toInt())
+                        }, lp(dp(20), dp(20)).apply { marginEnd = dp(6) })
                         addView(vbox().apply {
                             addView(tv(label, 11f, lavender))
-                            val value = tv("\u2014", 13f, Color.WHITE, true)
+                            val value = tv("Unavailable", 13f, foreground, true)
                             exitFacts[key] = value
                             addView(value, lp(MATCH, WRAP))
                         }, lp(0, WRAP, 1f))
@@ -1071,15 +1233,20 @@ class MainActivity : Activity() {
 
         addView(row().apply {
             addView(tv("Received", 10f, lavender), lp(WRAP, WRAP))
-            downloadTv = tv("\u2014", 10f, Color.WHITE)
+            downloadTv = tv("\u2014", 10f, foreground)
             addView(downloadTv, lp(WRAP, WRAP).apply { marginStart = dp(4) })
             addView(View(this@MainActivity), lp(0, 1, 1f))
             addView(tv("Sent", 10f, lavender), lp(WRAP, WRAP))
-            uploadTv = tv("\u2014", 10f, Color.WHITE)
+            uploadTv = tv("\u2014", 10f, foreground)
             addView(uploadTv, lp(WRAP, WRAP).apply { marginStart = dp(4) })
         }, lp(MATCH, WRAP).apply { topMargin = dp(5) })
-        addView(View(this@MainActivity).apply { background = round(green, 2) },
-            lp(MATCH, dp(2)).apply { topMargin = dp(5); marginStart = dp(3); marginEnd = dp(3) })
+        addView(vbox().apply {
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(0x0046F79B, 0x5146F79B)
+            )
+            addView(View(this@MainActivity).apply { background = round(0xFF46F79B.toInt(), 2) },
+                lp(MATCH, dp(3)).apply { topMargin = dp(5) })
+        }, lp(MATCH, WRAP).apply { topMargin = dp(2); marginStart = dp(3); marginEnd = dp(3) })
     }
 
     private fun updateConnectionDetailsStatus(state: String) {

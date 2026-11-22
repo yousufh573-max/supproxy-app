@@ -6,4 +6,8 @@
         <item name="android:windowLightStatusBar">true</item>
         <item name="android:windowLightNavigationBar">true</item>
     </style>
+    <style name="ProtocolDropdownAnimation">
+        <item name="android:windowEnterAnimation">@anim/protocol_dropdown_enter</item>
+        <item name="android:windowExitAnimation">@anim/protocol_dropdown_exit</item>
+    </style>
 </resources>

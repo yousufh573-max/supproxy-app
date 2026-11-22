@@ -10,6 +10,8 @@ import javax.net.ssl.SSLSocketFactory
 
 /** Opens a tunnelled TCP connection to dest:port through an upstream SOCKS5 or HTTP proxy. */
 object Upstream {
+    internal const val EXIT_LOOKUP_HOST = "ipwho.is"
+
     fun readN(i: InputStream, n: Int): ByteArray {
         val b = ByteArray(n)
         var off = 0

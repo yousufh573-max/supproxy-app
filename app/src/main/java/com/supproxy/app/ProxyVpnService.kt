@@ -220,7 +220,17 @@ class ProxyVpnService : VpnService() {
     }
 
     private fun monitor(profile: Profile, isRunning: () -> Boolean) {
-        if (stopRequested) return
+        if (stopRequested || !isRunning()) return
+        try {
+            val host = Upstream.EXIT_LOOKUP_HOST
+            Upstream.open(profile, host, 443).use { proxy ->
+                Upstream.verifiedTls(proxy, host, 443).use { }
+            }
+        } catch (e: IOException) {
+            if (Store.autoReconnect(this)) return
+            throw IOException("Could not verify the proxy connection", e)
+        }
+        if (stopRequested || !isRunning()) return
         val connected = "VPN connected"
         showForeground(connected)
         setStatus("Connected")
